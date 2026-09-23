@@ -30,6 +30,16 @@ D-pad, OK, Back, Home, Settings, Power, volume and channel.
 
 ## Install
 
+### Homebrew Channel
+
+Homebrew Channel > Settings > **Add repository**, and enter:
+
+```
+https://raw.githubusercontent.com/fivefold3/webos-homebrew-repo/main/repo.json
+```
+
+### Manual install
+
 Grab the `.ipk` from the releases page and install it with
 [webOS Dev Manager](https://github.com/webosbrew/dev-manager-desktop) or
 `ares-install`. If you used LG Input Hook before, your mappings are imported
