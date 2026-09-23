@@ -1,6 +1,6 @@
 {
   "id": "com.lginputmapper.app",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "vendor": "lginputmapper",
   "type": "web",
   "main": "index.html",

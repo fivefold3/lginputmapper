@@ -680,7 +680,7 @@ function boot() {
     // Right after boot, or while an update is being installed, the helpers can
     // be briefly unavailable: retry quietly a few times before giving up.
     var transient = e.code === 'timeout' || e.code === 'not_root' || /not (running|available)|timed? ?out|No answer/i.test(e.message || '');
-    if (transient && bootAttempt < 4) {
+    if (transient && bootAttempt < 3) {
       setTimeout(boot, 3000);
       return;
     }

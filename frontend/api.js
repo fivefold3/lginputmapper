@@ -2,7 +2,7 @@
 var SERVICE = 'luna://com.lginputmapper.app.service';
 var HBCHANNEL = 'luna://org.webosbrew.hbchannel.service';
 
-var TIMEOUT_MS = 20000;
+var TIMEOUT_MS = 10000;
 
 function request(uri, method, parameters) {
   return new Promise(function (resolve, reject) {

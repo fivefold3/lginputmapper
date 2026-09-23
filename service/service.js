@@ -510,7 +510,23 @@ Object.keys(api).forEach(function (method) {
 
 log('service ' + APP_VERSION + ' starting, root=' + isRoot + ', arch=' + process.arch + ', node=' + process.version + ', dir=' + SERVICE_DIR);
 
-// Keep the service alive so status/events stay warm between app launches.
+// Keep the process alive. Node exits as soon as its event loop is empty, and a
+// registered bus handle alone does not hold it open; without a timer the
+// service quit right after startup whenever the daemon was already running
+// (the wait for a freshly spawned daemon used to mask this). The interval also
+// keeps the event buffer warm and restarts the daemon if it ever dies.
+setInterval(function () {
+  try { pumpEvents(); } catch (e) {}
+}, 2000);
+setInterval(function () {
+  if (!isRoot) return;
+  try {
+    if (!daemonStatus().running) {
+      log('daemon not running, restarting');
+      ensureDaemon().then(null, function (e) { log('daemon restart failed: ' + e); });
+    }
+  } catch (e) {}
+}, 30000);
 try {
   service.activityManager.create('keepAlive', function () {});
 } catch (e) {

@@ -35,7 +35,7 @@
 #include "vendor/cJSON.h"
 
 #ifndef LGINPUTMAPPERD_VERSION
-#define LGINPUTMAPPERD_VERSION "1.0.0"
+#define LGINPUTMAPPERD_VERSION "1.0.1"
 #endif
 
 #define DEFAULT_CONFIG "/home/root/.config/lginputmapper/config.json"
