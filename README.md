@@ -28,6 +28,16 @@ script.
 Some buttons are deliberately not remappable so the TV stays usable: the
 D-pad, OK, Back, Home, Settings, Power, volume and channel.
 
+## Limitations
+
+**Waking the TV from standby.** A hotkey (Netflix, LG Channels, …) pressed while
+the TV is in standby keeps its original meaning: the TV turns on and launches
+that app, even if the button is remapped. The wake-up key is handled by the
+TV's power-management firmware, which powers the TV on and launches the app
+from the recorded wake reason; it never reaches the remote's input device, so
+there is nothing for the remapper to intercept. Once the TV is on, the button
+behaves as mapped.
+
 ## Install
 
 ### Homebrew Channel
