@@ -1,0 +1,13 @@
+{
+  "id": "com.lginputmapper.app",
+  "version": "1.0.0",
+  "vendor": "lginputmapper",
+  "type": "web",
+  "main": "index.html",
+  "title": "LG Input Mapper",
+  "icon": "icon.png",
+  "largeIcon": "largeIcon.png",
+  "iconColor": "#000000",
+  "appDescription": "Remap, disable, or repurpose the buttons on your LG remote. Requires Homebrew Channel with root.",
+  "disableBackHistoryAPI": true
+}
