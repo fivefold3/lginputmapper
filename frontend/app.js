@@ -668,7 +668,9 @@ function boot() {
     bootLog('Starting remapper…');
     return retry(function () { return api.call('setup'); }, 6, 1000);
   }).then(function () {
-    return Promise.all([api.call('getConfig'), refreshStatus()]);
+    // setup locks the service's bus role down to this app. Should that keep us
+    // out on this TV, the service restores the role after a few seconds.
+    return retry(function () { return Promise.all([api.call('getConfig'), refreshStatus()]); }, 5, 2500);
   }).then(function (res) {
     S.config = res[0].config;
     S.screen = 'main';

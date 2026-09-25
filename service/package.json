@@ -1,6 +1,6 @@
 {
   "name": "com.lginputmapper.app.service",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "LG Input Mapper service: configuration, key monitor and daemon control",
   "main": "service.js",
   "license": "MIT"

@@ -85,8 +85,18 @@ Layout:
 - `shared/keys.js` – known button codes (verified on an MR25GA).
 
 Runtime files: config `/home/root/.config/lginputmapper/config.json`,
-state `/tmp/lginputmapperd/{status.json,events.jsonl,daemon.log,service.log}`,
-boot script `/var/lib/webosbrew/init.d/lginputmapper`.
+state `/tmp/lginputmapperd/{status.json,daemon.log,service.log}`,
+boot script `/var/lib/webosbrew/init.d/lginputmapper`. Button presses are only
+written down (`events.jsonl`) while the key picker or the key monitor is open,
+and the file is deleted when it closes.
+
+Security: the service runs as root and stores `exec` commands the daemon runs
+as root, so it only answers calls from the LG Input Mapper app itself.
+Homebrew Channel's elevation opens the service's Luna role to every caller;
+the service locks it back down to the app after each launch (and restores it
+by itself if that ever keeps the app out). The installed files are made
+writable by their owner only, and the config and state directories are
+root-only.
 
 ### Config format
 

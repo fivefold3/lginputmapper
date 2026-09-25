@@ -26,19 +26,53 @@ var STATE_DIR = '/tmp/lginputmapperd';
 var INIT_DIR = '/var/lib/webosbrew/init.d';
 var INIT_SCRIPT = INIT_DIR + '/lginputmapper';
 var HBCHANNEL_SERVICE = '/media/developer/apps/usr/palm/services/org.webosbrew.hbchannel.service';
+// Installed package trees (ares-package ships every directory as 0777).
+var INSTALL_DIRS = [
+  '/media/developer/apps/usr/palm/applications/' + APP_ID,
+  '/media/developer/apps/usr/palm/services/' + pkgInfo.name,
+  '/media/developer/apps/usr/palm/packages/' + APP_ID,
+];
+// Homebrew Channel's elevate-service opens our LS2 role to everyone; see lockRole().
+var LUNA_ROOTS = ['/var/luna-service2-dev', '/var/luna-service2'];
+var ELEVATE_NAMES = ['*', 'com.webos.service.capture.client*'];
+// Written when locking the role cut the app off, so this version stops trying.
+var ROLE_LOCK_OPTOUT = CONFIG_DIR + '/role-lock-disabled';
 
 var service = new Service(pkgInfo.name);
 var isRoot = typeof process.getuid === 'function' && process.getuid() === 0;
+
+// The state dir sits in world-writable /tmp and holds the pid the service
+// signals, the capture file the daemon obeys and the logs. Anything there we
+// did not create ourselves (a symlink, or a directory owned by someone else,
+// e.g. by the unprivileged service instance before elevation) is moved aside.
+var stateDirOk = false;
+
+function ensureStateDir() {
+  if (stateDirOk && fs.existsSync(STATE_DIR)) return;
+  if (!isRoot) {
+    if (!fs.existsSync(STATE_DIR)) fs.mkdirSync(STATE_DIR, 448 /* 0700 */);
+    return;
+  }
+  var st = null;
+  try { st = fs.lstatSync(STATE_DIR); } catch (e) {}
+  if (st && (!st.isDirectory() || st.uid !== 0)) {
+    fs.renameSync(STATE_DIR, STATE_DIR + '.untrusted-' + Date.now());
+    st = null;
+  }
+  if (!st) fs.mkdirSync(STATE_DIR, 448);
+  fs.chmodSync(STATE_DIR, 448);
+  stateDirOk = true;
+}
 
 function log() {
   var args = Array.prototype.slice.call(arguments);
   var line = new Date().toISOString() + ' ' + args.join(' ');
   console.log('[lginputmapper] ' + line);
   try {
-    if (!fs.existsSync(STATE_DIR)) fs.mkdirSync(STATE_DIR);
+    ensureStateDir();
     var file = STATE_DIR + '/service.log';
     try { if (fs.statSync(file).size > 512 * 1024) fs.renameSync(file, file + '.1'); } catch (e) {}
-    fs.appendFileSync(file, line + '\n');
+    fs.appendFileSync(file, line + '\n', { mode: 384 /* 0600 */ });
   } catch (e) {}
 }
 
@@ -56,16 +90,18 @@ function readJson(file, fallback) {
   }
 }
 
-function mkdirp(dir) {
+function mkdirp(dir, mode) {
   if (fs.existsSync(dir)) return;
   mkdirp(path.dirname(dir));
-  fs.mkdirSync(dir);
+  fs.mkdirSync(dir, mode);
 }
 
+// Everything the service writes is only ever read by root (itself or the daemon).
 function writeFileAtomic(file, data) {
-  mkdirp(path.dirname(file));
+  mkdirp(path.dirname(file), 448 /* 0700 */);
   var tmp = file + '.tmp';
-  fs.writeFileSync(tmp, data);
+  try { fs.unlinkSync(tmp); } catch (e) {}
+  fs.writeFileSync(tmp, data, { mode: 384 /* 0600 */ });
   fs.renameSync(tmp, file);
 }
 
@@ -127,7 +163,7 @@ function startDaemon(replace) {
   var bin = daemonBinary();
   if (!fs.existsSync(bin)) throw new ApiError('Daemon binary missing: ' + bin);
   try { fs.chmodSync(bin, 493 /* 0755 */); } catch (e) {}
-  mkdirp(STATE_DIR);
+  ensureStateDir();
   var args = ['--config', CONFIG_PATH, '--state-dir', STATE_DIR, '--log', STATE_DIR + '/daemon.log', '--pidfile', STATE_DIR + '/pid'];
   if (replace) args.push('--replace');
   var child = childProcess.spawn(bin, args, { detached: true, stdio: 'ignore' });
@@ -183,7 +219,7 @@ function initScriptContents() {
     '# scripts in ' + INIT_DIR + ' as root at boot. Removes itself if the app is gone.',
     'BIN="' + daemonBinary() + '"',
     'if [ ! -x "$BIN" ]; then rm -f "$0"; exit 0; fi',
-    'mkdir -p ' + STATE_DIR,
+    'mkdir -p -m 700 ' + STATE_DIR,
     'nohup "$BIN" --replace --config ' + CONFIG_PATH + ' --state-dir ' + STATE_DIR +
       ' --log ' + STATE_DIR + '/daemon.log --pidfile ' + STATE_DIR + '/pid >/dev/null 2>&1 </dev/null &',
     'exit 0',
@@ -207,6 +243,116 @@ function setAutostart(enable) {
     fs.unlinkSync(INIT_SCRIPT);
   }
   return autostartStatus();
+}
+
+// ---------------------------------------------------------------- hardening
+
+// The daemon binary, the init script target and the app's own JS (which may
+// call this service) all live in the installed trees: nobody but their owner
+// may write there. Directories and executables 0755, everything else 0644.
+function lockDownTree(dir, owners) {
+  var st;
+  try { st = fs.lstatSync(dir); } catch (e) { return; }
+  if (st.isSymbolicLink()) return;
+  owners[st.uid + ':' + st.gid] = true;
+  var mode = st.isDirectory() || (st.mode & 73 /* 0111 */) ? 493 /* 0755 */ : 420 /* 0644 */;
+  if ((st.mode & 4095) !== mode) fs.chmodSync(dir, mode);
+  if (st.isDirectory()) fs.readdirSync(dir).forEach(function (name) { lockDownTree(path.join(dir, name), owners); });
+}
+
+function lockDownInstall() {
+  var owners = {};
+  INSTALL_DIRS.forEach(function (dir) {
+    try { lockDownTree(dir, owners); } catch (e) { log('lock down ' + dir + ': ' + e.message); }
+  });
+  return Object.keys(owners);
+}
+
+function roleLockOptedOut() {
+  try { return fs.readFileSync(ROLE_LOCK_OPTOUT, 'utf8').trim() === APP_VERSION; } catch (e) { return false; }
+}
+
+function rescanServices() {
+  return new Promise(function (resolve) {
+    childProcess.execFile('ls-control', ['scan-services'], { timeout: 10000, env: { PATH: '/usr/sbin:/usr/bin:/sbin:/bin' } }, function (err) {
+      if (err) log('ls-control scan-services failed: ' + err);
+      resolve();
+    });
+  });
+}
+
+function writeRoleFile(file, text) {
+  writeFileAtomic(file, text);
+  fs.chmodSync(file, 420 /* 0644, the hub reads it */);
+}
+
+// Set while a freshly locked role waits for proof that the app still gets through.
+var roleLockPending = null;
+var ROLE_LOCK_CONFIRM_MS = 8000;
+
+// Undo what elevate-service adds to our role (any name, any caller) and only
+// let the app call in. The app runs elevate-service on every launch, which
+// reopens the role, and calls setup right after, which locks it again.
+// Should the hub then keep the app out on some TV (it names web app callers
+// differently), no call arrives and revertRoleLock() restores the role and
+// stops locking it for this version. Resolves to true if a role file changed.
+function lockRole() {
+  var originals = {};
+  LUNA_ROOTS.forEach(function (root) {
+    var file = root + '/roles.d/' + pkgInfo.name + '.service.json';
+    var text;
+    try { text = fs.readFileSync(file, 'utf8'); } catch (e) { return; }
+    var role = JSON.parse(text);
+    if (!role || !Array.isArray(role.allowedNames) || !Array.isArray(role.permissions)) return;
+    var before = JSON.stringify(role);
+    role.allowedNames = role.allowedNames.filter(function (n) { return ELEVATE_NAMES.indexOf(n) < 0; });
+    role.permissions = role.permissions.filter(function (p) { return p && ELEVATE_NAMES.indexOf(p.service) < 0; });
+    role.permissions.forEach(function (p) { p.inbound = [APP_ID]; });
+    var after = JSON.stringify(role);
+    if (after === before) return;
+    log('locking role ' + file + ': ' + before + ' -> ' + after);
+    writeRoleFile(file, after);
+    originals[file] = text;
+  });
+  if (!Object.keys(originals).length) return Promise.resolve(false);
+  return rescanServices().then(function () {
+    if (roleLockPending) clearTimeout(roleLockPending.timer);
+    roleLockPending = { originals: originals, timer: setTimeout(revertRoleLock, ROLE_LOCK_CONFIRM_MS) };
+    return true;
+  });
+}
+
+function confirmRoleLock() {
+  if (!roleLockPending) return;
+  clearTimeout(roleLockPending.timer);
+  roleLockPending = null;
+  log('role lock confirmed, the app still gets through');
+}
+
+function revertRoleLock() {
+  var pending = roleLockPending;
+  roleLockPending = null;
+  if (!pending) return;
+  log('no call from the app within ' + ROLE_LOCK_CONFIRM_MS + ' ms of locking the role: restoring it, not locking again in ' + APP_VERSION);
+  try {
+    Object.keys(pending.originals).forEach(function (file) { writeRoleFile(file, pending.originals[file]); });
+    writeFileAtomic(ROLE_LOCK_OPTOUT, APP_VERSION + '\n');
+  } catch (e) {
+    log('restoring role: ' + e.message);
+  }
+  rescanServices();
+}
+
+function harden() {
+  requireRoot();
+  var result = { owners: lockDownInstall(), roleChanged: false, roleLockDisabled: roleLockOptedOut() };
+  if (result.roleLockDisabled) return Promise.resolve(result);
+  var locking;
+  try { locking = lockRole(); } catch (e) { log('lock role: ' + e.message); locking = Promise.resolve(false); }
+  return locking.then(function (changed) {
+    result.roleChanged = changed;
+    return result;
+  });
 }
 
 // ------------------------------------------------------------------ config
@@ -297,16 +443,26 @@ function saveConfig(cfg) {
 
 // ------------------------------------------------------------------ events
 
+// The daemon only writes events.jsonl while capture mode is on (key picker,
+// key monitor) and deletes it when capture ends; nothing is kept otherwise.
 var eventBuffer = [];
 var eventOffset = 0;
 var eventPartial = '';
+var eventIno = 0;
 var EVENT_BUFFER_MAX = 600;
+
+function resetEvents() {
+  eventBuffer = [];
+  eventOffset = 0;
+  eventPartial = '';
+  eventIno = 0;
+}
 
 function pumpEvents() {
   var file = STATE_DIR + '/events.jsonl';
   var st;
-  try { st = fs.statSync(file); } catch (e) { return; }
-  if (st.size < eventOffset) { eventOffset = 0; eventPartial = ''; }
+  try { st = fs.statSync(file); } catch (e) { resetEvents(); return; }
+  if (st.ino !== eventIno || st.size < eventOffset) { eventOffset = 0; eventPartial = ''; eventIno = st.ino; }
   if (st.size === eventOffset) return;
   var fd = fs.openSync(file, 'r');
   try {
@@ -369,7 +525,7 @@ var api = {
     requireRoot();
     var ms = Math.min(Math.max(params.ms || 8000, 1000), 120000);
     var until = Date.now() + ms;
-    mkdirp(STATE_DIR);
+    ensureStateDir();
     // Back (412) is always let through so the app can cancel the capture.
     var passthrough = Array.isArray(params.passthrough) ? params.passthrough : [412];
     writeFileAtomic(STATE_DIR + '/capture.json', JSON.stringify({ until: until, swallow: params.swallow !== false, passthrough: passthrough }));
@@ -378,8 +534,9 @@ var api = {
 
   stopCapture: function () {
     requireRoot();
-    mkdirp(STATE_DIR);
+    ensureStateDir();
     writeFileAtomic(STATE_DIR + '/capture.json', JSON.stringify({ until: 0 }));
+    resetEvents();
     return {};
   },
 
@@ -474,13 +631,15 @@ var api = {
     return { added: added.length, config: cfg };
   },
 
-  // Convenience for the TV app: elevate + autostart + daemon in one go.
+  // Convenience for the TV app: autostart + daemon + hardening in one go.
   setup: function () {
     requireRoot();
     try { loadConfig(); } catch (e) { log('config: ' + e.message); }
     setAutostart(true);
     return ensureDaemon().then(function (d) {
-      return { daemon: d, autostart: autostartStatus() };
+      return harden().then(function (h) {
+        return { daemon: d, autostart: autostartStatus(), hardening: h };
+      });
     });
   },
 };
@@ -492,8 +651,30 @@ function dispatch(method, params) {
   });
 }
 
+// Only our own app may call in: setConfig stores commands the daemon runs as
+// root. webos-service sets sender to the WAM application id of a web app
+// caller (pid stripped), otherwise to the caller's bus name, both vouched for
+// by the hub. This holds even while Homebrew Channel has the role wide open.
+function callerOf(message) {
+  if (message.sender) return String(message.sender);
+  var m = message.ls2Message;
+  try {
+    var id = m.applicationID ? m.applicationID() : '';
+    return id ? String(id).split(' ')[0] : String(m.senderServiceName() || '');
+  } catch (e) {
+    return '';
+  }
+}
+
 Object.keys(api).forEach(function (method) {
   service.register(method, function (message) {
+    var caller = callerOf(message);
+    if (caller !== APP_ID) {
+      log('refused ' + method + ' from ' + (caller || '(unknown caller)'));
+      message.respond({ returnValue: false, errorText: 'Only ' + APP_ID + ' may call this service', errorCode: 'forbidden' });
+      return;
+    }
+    confirmRoleLock();
     if (method !== 'getEvents' && method !== 'clientLog') log('call ' + method);
     dispatch(method, message.payload).then(function (res) {
       res = res || {};
@@ -514,10 +695,7 @@ log('service ' + APP_VERSION + ' starting, root=' + isRoot + ', arch=' + process
 // registered bus handle alone does not hold it open; without a timer the
 // service quit right after startup whenever the daemon was already running
 // (the wait for a freshly spawned daemon used to mask this). The interval also
-// keeps the event buffer warm and restarts the daemon if it ever dies.
-setInterval(function () {
-  try { pumpEvents(); } catch (e) {}
-}, 2000);
+// restarts the daemon if it ever dies.
 setInterval(function () {
   if (!isRoot) return;
   try {
@@ -535,6 +713,10 @@ try {
 
 if (isRoot) {
   try {
+    // An install or update ships the trees world-writable again.
+    log('install tree owners: ' + lockDownInstall().join(', '));
+    // Created 0755/0644 by older versions.
+    try { fs.chmodSync(CONFIG_DIR, 448 /* 0700 */); fs.chmodSync(CONFIG_PATH, 384 /* 0600 */); } catch (e) {}
     try { loadConfig(); } catch (e) { log('config: ' + e.message); }
     ensureDaemon().then(function (d) {
       log('daemon ' + (d.running ? 'running pid ' + d.pid : 'NOT running'));

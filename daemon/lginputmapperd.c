@@ -219,7 +219,8 @@ static int write_all(int fd, const void *buf, size_t len) {
 static int write_file_atomic(const char *path, const char *data) {
     char tmp[512];
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
-    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    unlink(tmp);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (fd < 0) return -1;
     int rc = write_all(fd, data, strlen(data));
     close(fd);
@@ -490,25 +491,44 @@ static int capture_active(void) {
     return g_capture.until_ms > 0 && now_ms() < g_capture.until_ms;
 }
 
+static void open_events_log(void);
+static void close_events_log(void);
+
+static void apply_capture(void) {
+    load_capture();
+    if (capture_active()) open_events_log();
+    else close_events_log();
+}
+
 /* ---------------------------------------------------------------- events log */
 
-static void open_events_log(void) {
+/* Key presses are only recorded while capture mode is on: the app's key picker
+ * and key monitor are the only readers. The file is removed as soon as capture
+ * ends, so no history of button presses is kept. */
+static void close_events_log(void) {
     char path[512];
     snprintf(path, sizeof path, "%s/events.jsonl", g_state_dir);
-    if (g_events) fclose(g_events);
-    g_events = fopen(path, "ae"); /* e: close-on-exec, keep it away from exec'd commands */
-    if (!g_events) { WARN("cannot open %s: %s", path, strerror(errno)); return; }
-    g_events_bytes = ftell(g_events);
+    if (g_events) { fclose(g_events); g_events = NULL; }
+    unlink(path);
+}
+
+static void open_events_log(void) {
+    if (g_events) return;
+    char path[512];
+    snprintf(path, sizeof path, "%s/events.jsonl", g_state_dir);
+    unlink(path);
+    /* close-on-exec keeps it away from exec'd commands */
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0) { WARN("cannot open %s: %s", path, strerror(errno)); return; }
+    g_events = fdopen(fd, "w");
+    if (!g_events) { WARN("cannot open %s: %s", path, strerror(errno)); close(fd); unlink(path); return; }
+    g_events_bytes = 0;
 }
 
 static void rotate_events_log_if_needed(void) {
-    if (g_events_bytes < 512 * 1024) return;
-    char a[512], b[512];
-    snprintf(a, sizeof a, "%s/events.jsonl", g_state_dir);
-    snprintf(b, sizeof b, "%s/events.1.jsonl", g_state_dir);
-    fclose(g_events);
-    g_events = NULL;
-    rename(a, b);
+    if (g_events_bytes < 256 * 1024) return;
+    /* A monitor left open for hours: start over (the service notices the new file). */
+    close_events_log();
     open_events_log();
 }
 
@@ -1366,20 +1386,37 @@ static void close_inherited_fds(void) {
     closedir(d);
 }
 
-static void mkdir_p(const char *path) {
+static void mkdir_p(const char *path, mode_t mode) {
     char tmp[512];
     snprintf(tmp, sizeof tmp, "%s", path);
     for (char *p = tmp + 1; *p; p++) {
         if (*p == '/') { *p = 0; mkdir(tmp, 0755); *p = '/'; }
     }
-    mkdir(tmp, 0755);
+    mkdir(tmp, mode);
+}
+
+/* The state dir usually sits in world-writable /tmp and holds the pid file, the
+ * capture file we obey and the logs: only use a real directory owned by us and
+ * move anything else aside. Returns 1 if something was moved. */
+static int ensure_state_dir(void) {
+    struct stat st;
+    int moved = 0;
+    if (lstat(g_state_dir, &st) == 0 && (!S_ISDIR(st.st_mode) || st.st_uid != geteuid())) {
+        char aside[600];
+        snprintf(aside, sizeof aside, "%s.untrusted-%lld", g_state_dir, (long long)now_ms());
+        if (rename(g_state_dir, aside) == 0) moved = 1;
+    }
+    mkdir_p(g_state_dir, 0700);
+    chmod(g_state_dir, 0700);
+    return moved;
 }
 
 static int acquire_lock(int replace) {
     char path[512];
     snprintf(path, sizeof path, "%s/lock", g_state_dir);
-    int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (fd < 0) { ERR("cannot open lock %s: %s", path, strerror(errno)); return -1; }
+    fchmod(fd, 0600); /* older versions created it world-readable */
     for (int attempt = 0; attempt < 50; attempt++) {
         if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
             char buf[32];
@@ -1430,22 +1467,25 @@ int main(int argc, char **argv) {
 
     if (list) { list_devices(); return 0; }
 
+    int state_moved = ensure_state_dir();
+
     if (log_path) {
-        int fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+        int fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0600);
         if (fd < 0) { ERR("cannot open log %s: %s", log_path, strerror(errno)); return 1; }
         struct stat st;
         if (fstat(fd, &st) == 0 && st.st_size > 1024 * 1024) { ftruncate(fd, 0); }
+        fchmod(fd, 0600); /* older versions created it world-readable */
         dup2(fd, 2);
         dup2(fd, 1);
         close(fd);
     }
 
-    mkdir_p(g_state_dir);
+    if (state_moved) WARN("%s was not ours, moved it aside", g_state_dir);
     {
         char cdir[512];
         snprintf(cdir, sizeof cdir, "%s", g_config_path);
         char *slash = strrchr(cdir, '/');
-        if (slash) { *slash = 0; mkdir_p(cdir); }
+        if (slash) { *slash = 0; mkdir_p(cdir, 0700); }
     }
 
     int lock_fd = acquire_lock(replace);
@@ -1467,9 +1507,14 @@ int main(int argc, char **argv) {
     LOG("lginputmapperd %s starting (pid %d, config %s, state %s%s)", LGINPUTMAPPERD_VERSION, getpid(),
         g_config_path, g_state_dir, g_dry_run ? ", DRY RUN" : "");
 
-    open_events_log();
     load_config();
-    load_capture();
+    {
+        /* Left behind by versions that logged every key press. */
+        char old[512];
+        snprintf(old, sizeof old, "%s/events.1.jsonl", g_state_dir);
+        unlink(old);
+    }
+    apply_capture();
 
     int ino = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
     if (ino < 0) { ERR("inotify_init: %s", strerror(errno)); return 1; }
@@ -1521,7 +1566,7 @@ int main(int argc, char **argv) {
                     } else if (ev->wd == w_cfg) {
                         if (ev->len && !strcmp(ev->name, cfg_base)) reload_cfg = 1;
                     } else if (ev->wd == w_state) {
-                        if (ev->len && !strcmp(ev->name, "capture.json")) { load_capture(); status_dirty = 1; }
+                        if (ev->len && !strcmp(ev->name, "capture.json")) { apply_capture(); status_dirty = 1; }
                     }
                     p += sizeof *ev + ev->len;
                 }
@@ -1546,6 +1591,7 @@ int main(int argc, char **argv) {
         if (g_capture.until_ms > 0 && !capture_active()) {
             LOG("capture mode ended");
             g_capture.until_ms = 0;
+            close_events_log();
             status_dirty = 1;
         }
 

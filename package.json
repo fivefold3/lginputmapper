@@ -1,6 +1,6 @@
 {
   "name": "com.lginputmapper.app",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "LG Input Mapper - remap the buttons on your LG remote (rooted webOS)",
   "private": true,
   "scripts": {
