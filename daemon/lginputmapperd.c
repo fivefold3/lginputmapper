@@ -27,6 +27,7 @@
 #include <sys/file.h>
 #include <sys/inotify.h>
 #include <sys/ioctl.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <linux/input.h>
@@ -35,7 +36,7 @@
 #include "vendor/cJSON.h"
 
 #ifndef LGINPUTMAPPERD_VERSION
-#define LGINPUTMAPPERD_VERSION "1.0.1"
+#define LGINPUTMAPPERD_VERSION "1.1.0"
 #endif
 
 #define DEFAULT_CONFIG "/home/root/.config/lginputmapper/config.json"
@@ -92,6 +93,8 @@ struct action {
 struct mapping {
     int key;
     int enabled;
+    int looped;        /* part of a loop of "acts as" mappings: the button does nothing */
+    int standby;       /* 0: the button must not turn the TV on from standby */
     char *label;
     struct action press;
     int has_hold;
@@ -119,6 +122,7 @@ struct device {
     int out_has_rep;
     unsigned long out_keybits[NLONGS(MAX_KEY_CNT)]; /* keys the output device accepts */
     unsigned long out_down[NLONGS(MAX_KEY_CNT)];    /* keys currently pressed on the output */
+    unsigned long eaten[NLONGS(MAX_KEY_CNT)];       /* presses used to wake the TV: drop their release too */
     int64_t out_retry_at;
     char path[64];
     char name[128];
@@ -153,6 +157,7 @@ static struct config g_cfg;
 static struct device g_devs[MAX_DEVS];
 static struct capture g_capture;
 static char *g_config_path = DEFAULT_CONFIG;
+static char g_config_dir[512];
 static char *g_state_dir = DEFAULT_STATE_DIR;
 static int g_kernel_key_cnt = MAX_KEY_CNT;   /* refined from EVIOCGBIT */
 static int g_verbose = 0;
@@ -320,6 +325,41 @@ static void parse_patterns(cJSON *arr, char ***out, int *n) {
 
 static void reset_key_states(void);
 
+/* Keys a mapping sends in place of its own ("acts as", on press or hold). */
+static int replace_targets(const struct mapping *m, int out[2]) {
+    int n = 0;
+    if (!m || !m->enabled) return 0;
+    if (m->press.type == ACT_REPLACE) out[n++] = m->press.to;
+    if (m->has_hold && m->hold.type == ACT_REPLACE) out[n++] = m->hold.to;
+    return n;
+}
+
+/* Marks the mappings whose "acts as" chain leads back to their own key
+ * (Netflix acts as LG Channels, LG Channels acts as Netflix). They stay in
+ * the config, shown as a loop by the app, and the buttons do nothing until the
+ * loop is broken. Returns how many were marked. */
+static int mark_loops(struct config *c) {
+    static unsigned long seen[NLONGS(MAX_KEY_CNT)];
+    int stack[MAX_KEY_CNT];
+    int loops = 0;
+    for (int i = 0; i < c->nmaps; i++) {
+        struct mapping *start = &c->list[i];
+        start->looped = 0;
+        memset(seen, 0, sizeof seen);
+        int sp = replace_targets(start, stack);
+        while (sp > 0 && !start->looped) {
+            int k = stack[--sp];
+            if (k == start->key) { start->looped = 1; break; }
+            if (k <= 0 || k >= MAX_KEY_CNT || TEST_BIT(k, seen)) continue;
+            seen[k / BITS_PER_LONG] |= 1UL << (k % BITS_PER_LONG);
+            int t[2], n = replace_targets(c->by_key[k], t);
+            for (int j = 0; j < n && sp < MAX_KEY_CNT; j++) stack[sp++] = t[j];
+        }
+        if (start->looped) loops++;
+    }
+    return loops;
+}
+
 static int load_config(void) {
     struct config nc;
     memset(&nc, 0, sizeof nc);
@@ -405,6 +445,7 @@ static int load_config(void) {
             m.key = key->valueint;
             cJSON *en = cJSON_GetObjectItemCaseSensitive(it, "enabled");
             m.enabled = en ? cJSON_IsTrue(en) : 1;
+            m.standby = !cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(it, "standby"));
             cJSON *label = cJSON_GetObjectItemCaseSensitive(it, "label");
             if (cJSON_IsString(label)) m.label = xstrdup(label->valuestring);
             cJSON *act = cJSON_GetObjectItemCaseSensitive(it, "action");
@@ -452,6 +493,10 @@ static int load_config(void) {
     g_cfg = nc;
     memset(g_cfg.by_key, 0, sizeof g_cfg.by_key);
     for (int i = 0; i < g_cfg.nmaps; i++) g_cfg.by_key[g_cfg.list[i].key] = &g_cfg.list[i];
+    if (mark_loops(&g_cfg)) {
+        for (int i = 0; i < g_cfg.nmaps; i++)
+            if (g_cfg.list[i].looped) WARN("key %d is part of a loop of \"acts as\" mappings: it does nothing until the loop is broken", g_cfg.list[i].key);
+    }
     g_cfg.loaded_ok = 1;
     g_cfg.error[0] = 0;
     LOG("config loaded: %d mapping(s), output=%s%s, holdMs=%d", g_cfg.nmaps,
@@ -558,6 +603,8 @@ static void log_event(struct device *d, const struct raw_event *e, const char *a
 
 /* ---------------------------------------------------------------- status */
 
+static void standby_status(cJSON *root);
+
 static void write_status(void) {
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "version", LGINPUTMAPPERD_VERSION);
@@ -573,10 +620,15 @@ static void write_status(void) {
     cJSON_AddStringToObject(cfg, "error", g_cfg.error);
     cJSON_AddNumberToObject(cfg, "mappings", g_cfg.nmaps);
     cJSON_AddStringToObject(cfg, "output", g_cfg.output_mode == OUT_CLONE ? "clone" : g_cfg.output_device);
+    cJSON *loops = cJSON_AddArrayToObject(cfg, "loops");
+    for (int i = 0; i < g_cfg.nmaps; i++)
+        if (g_cfg.list[i].looped) cJSON_AddItemToArray(loops, cJSON_CreateNumber(g_cfg.list[i].key));
 
     cJSON *cap = cJSON_AddObjectToObject(root, "capture");
     cJSON_AddBoolToObject(cap, "active", capture_active());
     cJSON_AddNumberToObject(cap, "until", (double)g_capture.until_ms);
+
+    standby_status(root);
 
     cJSON *devs = cJSON_AddArrayToObject(root, "devices");
     for (int i = 0; i < MAX_DEVS; i++) {
@@ -1191,6 +1243,8 @@ static void resolve_hold(struct device *d) {
     }
 }
 
+static int standby_wake_key_pressed(int code);
+
 static void handle_key(struct device *d, const struct raw_event *e) {
     int code = e->code;
     int value = e->value;
@@ -1217,6 +1271,20 @@ static void handle_key(struct device *d, const struct raw_event *e) {
         for (int i = 0; i < g_capture.npass && !pass; i++) if (g_capture.pass[i] == code) pass = 1;
         log_event(d, e, pass ? "capture:pass" : "capture", 0);
         if (pass) out_push(d, EV_KEY, (uint16_t)code, value);
+        return;
+    }
+
+    /* A hotkey pressed while the TV is in active standby (on, screen dark)
+     * arrives here instead of at the micom: turn the TV on the way a wake from
+     * standby would, and drop the rest of the press. */
+    if (code < MAX_KEY_CNT && TEST_BIT(code, d->eaten)) {
+        if (value == 0) d->eaten[code / BITS_PER_LONG] &= ~(1UL << (code % BITS_PER_LONG));
+        log_event(d, e, "wake", 0);
+        return;
+    }
+    if (value == 1 && code < MAX_KEY_CNT && standby_wake_key_pressed(code)) {
+        d->eaten[code / BITS_PER_LONG] |= 1UL << (code % BITS_PER_LONG);
+        log_event(d, e, "wake", 0);
         return;
     }
 
@@ -1262,6 +1330,10 @@ static void handle_key(struct device *d, const struct raw_event *e) {
     if (!m || !m->enabled) {
         log_event(d, e, "pass", 0);
         out_push(d, EV_KEY, (uint16_t)code, value);
+        return;
+    }
+    if (m->looped) {
+        log_event(d, e, "loop", 0); /* a button in a loop does nothing */
         return;
     }
 
@@ -1348,10 +1420,839 @@ static void handle_device_input(struct device *d) {
     }
 }
 
+/* ---------------------------------------------------------------- standby */
+
+/* A hotkey pressed while the TV is in standby never reaches the input devices:
+ * the micom wakes the TV with a power-on reason named after the key, and bootd
+ * opens the app that LG's setting other.mapping_info lists for that reason
+ * (the table is re-read from /var/luna/preferences/other on every wake).
+ *
+ * So the entries of remapped hotkeys are rewritten through the settings
+ * service: a launch mapping opens its app straight away, anything else wakes
+ * the TV like the power button (isActive false). Replace and exec actions then
+ * run once the system has resumed with that power-on reason. LG's own values
+ * are kept in standby.json and given back as soon as a mapping stops needing
+ * the change. LG's server also resets the table after every reboot; the
+ * rewrite is simply applied again. */
+
+#ifndef LG_PREFS_DIR   /* overridable for tests off the TV */
+#define LG_PREFS_DIR "/var/luna/preferences"
+#endif
+#define LG_PREFS_NAME "other"
+#define LG_PREFS_FILE LG_PREFS_DIR "/" LG_PREFS_NAME
+#define STANDBY_STATE_NAME "standby.json"
+/* A ready-made request that gives LG's table back, for the boot script to
+ * send if the app was uninstalled while the daemon could not do it itself. */
+#define STANDBY_RESTORE_NAME "standby-restore.json"
+/* The same for the micom's hotkey locks. */
+#define STANDBY_RESTORE_MICOM_NAME "standby-restore-micom.json"
+#ifndef INIT_SCRIPT
+#define INIT_SCRIPT "/var/lib/webosbrew/init.d/lginputmapper"
+#endif
+
+/* Hotkeys the micom can wake the TV with: Linux key code (LG's libStarfishInput
+ * key table), the power-on reason tvpowerd reports for it and the micom's lock
+ * for it (lowlevelstorage db "micom"; 1 = the key does not wake the TV). */
+static const struct { int key; const char *reason; const char *lock; } WAKE_KEYS[] = {
+    { 1037, "netflix", "NetflixKeyLock" }, { 1038, "amazon", "AmazonKeyLock" },
+    { 1039, "ivi", "IVIKeyLock" }, { 1041, "hotstar", "HotstarKeyLock" },
+    { 1042, "disneyplus", "DisneyplusKeyLock" }, { 1043, "lgchannels", "LGchannelsKeyLock" },
+    { 1044, "rakutentv", "RakutentvKeyLock" }, { 1045, "globoplay", "GloboplayKeyLock" },
+    { 1047, "okko", "OkkoKeyLock" }, { 1088, "kinopoisk", "KinopoiskKeyLock" },
+    { 1089, "watchaplay", "WatchaplayKeyLock" }, { 1090, "unext", "UnextKeyLock" },
+    { 1091, "fptplay", "FptplayKeyLock" }, { 1092, "shahid", "ShahidKeyLock" },
+    { 1095, "hulu", "HuluKeyLock" }, { 1096, "nhkplus", "NhkplusKeyLock" },
+    { 1097, "tod", "TodKeyLock" }, { 1099, "freeviewplay", "FreeviewplayKeyLock" },
+    { 1102, "sonyliv", "SonylivKeyLock" }, { 1107, "slingtv", "SlingtvKeyLock" },
+    { 1108, "tver", "TverKeyLock" }, { 1109, "wavve", "WavveKeyLock" },
+    { 1110, "coupangplay", "CoupangplayKeyLock" }, { 1111, "stan", "StanKeyLock" },
+    { 1120, "tv360", "Tv360KeyLock" }, { 1121, "vtvgo", "VtvgoKeyLock" },
+    { 1125, "vkvideo", "VkvideoKeyLock" }, { 1126, "premier", "PremierKeyLock" },
+};
+#define NWAKE ((int)(sizeof WAKE_KEYS / sizeof WAKE_KEYS[0]))
+/* Also in the micom's lock list, without a key code we know of. */
+static const char *OTHER_LOCK_REASONS[] = { "iplayer" };
+
+/* What a wake by each hotkey does right now, for status.json. */
+enum wake_mode { WM_ABSENT = 0, WM_LG, WM_INACTIVE, WM_LAUNCH, WM_NORMAL, WM_OFF };
+static const char *WAKE_MODE_NAMES[] = { "absent", "lg", "inactive", "launch", "normal", "off" };
+
+/* {"entries": {reason: {"lg": {...}, "ours": {...}, "lock": true}},
+ *  "micom": {reason: isActive, ...}}  (the lock list we sent, while ours apply) */
+static cJSON *g_sb_state;
+static enum wake_mode g_wake_mode[NWAKE];
+static char g_sb_error[200];
+static int64_t g_sb_retry_at;              /* mono ms, 0 = none */
+static int64_t g_sb_recheck_at;            /* mono ms: look at our key locks again, 0 = none */
+static int64_t g_sb_window_start;          /* write rate guard */
+static int g_sb_window_writes;
+static int g_sb_paused;
+
+static struct {
+    int active;
+    int stage;                             /* 0: wait until the TV is active, 1: run the action */
+    int key;
+    int64_t next;                          /* mono ms */
+    int64_t until;
+} g_wake;
+
+static struct {
+    char reason[32];
+    int key;
+    int64_t at;                            /* wall clock ms */
+    const char *action;
+} g_last_wake;
+
+/* A hotkey the daemon used to turn the TV on from active standby, in case
+ * tvpower reports a different reason for that wake. */
+static int g_standby_press_key;
+static int64_t g_standby_press_at;          /* mono ms */
+
+static char g_install_dir[512];            /* our service directory, when running from an installed package */
+static int g_uninstalled;                  /* remove our config and state dirs on the way out */
+static int64_t g_install_missing_since;
+static int64_t g_install_next_check;
+
+static int64_t boot_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_BOOTTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void config_dir_file(char *out, size_t len, const char *name) {
+    snprintf(out, len, "%s/%s", g_config_dir, name);
+}
+
+/* Runs luna-send and returns what it printed (malloc'd), or NULL. Bounded by
+ * luna-send's own exit timeout, and killed should it hang past that. */
+static char *luna_call(const char *uri, const char *payload, int timeout_ms) {
+    int pfd[2];
+    if (pipe2(pfd, O_CLOEXEC) < 0) { WARN("pipe: %s", strerror(errno)); return NULL; }
+    char wait_arg[16];
+    snprintf(wait_arg, sizeof wait_arg, "%d", timeout_ms);
+    pid_t pid = fork();
+    if (pid < 0) { WARN("fork failed: %s", strerror(errno)); close(pfd[0]); close(pfd[1]); return NULL; }
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) { dup2(devnull, 0); dup2(devnull, 2); }
+        dup2(pfd[1], 1);
+        signal(SIGCHLD, SIG_DFL);
+        char *argv[] = { "luna-send", "-n", "1", "-w", wait_arg, (char *)uri, (char *)payload, NULL };
+        execv("/usr/bin/luna-send", argv);
+        execvp("luna-send", argv);
+        _exit(127);
+    }
+    close(pfd[1]);
+    size_t cap = 4096, len = 0;
+    char *buf = malloc(cap);
+    int64_t deadline = mono_ms() + timeout_ms + 1000;
+    while (buf) {
+        int left = (int)(deadline - mono_ms());
+        if (left <= 0) {
+            kill(pid, SIGKILL);
+            WARN("luna-send %s did not finish, killed it", uri);
+            free(buf); buf = NULL;
+            break;
+        }
+        struct pollfd p = { .fd = pfd[0], .events = POLLIN };
+        int rc = poll(&p, 1, left);
+        if (rc < 0 && errno != EINTR) { free(buf); buf = NULL; break; }
+        if (rc <= 0) continue;
+        if (len + 1024 > cap) {
+            char *nb = realloc(buf, cap * 2);
+            if (!nb) { free(buf); buf = NULL; break; }
+            buf = nb; cap *= 2;
+        }
+        ssize_t n = read(pfd[0], buf + len, cap - len - 1);
+        if (n < 0) { if (errno == EINTR) continue; free(buf); buf = NULL; break; }
+        if (n == 0) break;
+        len += (size_t)n;
+    }
+    close(pfd[0]); /* SIGCHLD is ignored: the child reaps itself */
+    if (buf) buf[len] = 0;
+    return buf;
+}
+
+/* The response object when the call succeeded (returnValue true), else NULL. */
+static cJSON *luna_json(const char *uri, const char *payload, int timeout_ms) {
+    char *out = luna_call(uri, payload, timeout_ms);
+    if (!out) return NULL;
+    cJSON *r = cJSON_Parse(out);
+    if (!r || !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(r, "returnValue"))) {
+        WARN("%s failed: %.200s", uri, out);
+        cJSON_Delete(r);
+        r = NULL;
+    }
+    free(out);
+    return r;
+}
+
+static void standby_load_state(void) {
+    char path[600];
+    config_dir_file(path, sizeof path, STANDBY_STATE_NAME);
+    char *text = read_file(path);
+    cJSON_Delete(g_sb_state);
+    g_sb_state = text ? cJSON_Parse(text) : NULL;
+    if (text && !cJSON_IsObject(g_sb_state)) WARN("%s is unreadable, LG's original hotkey entries are lost", path);
+    free(text);
+    if (!cJSON_IsObject(g_sb_state)) { cJSON_Delete(g_sb_state); g_sb_state = cJSON_CreateObject(); }
+    if (!cJSON_IsObject(cJSON_GetObjectItemCaseSensitive(g_sb_state, "entries"))) {
+        cJSON_DeleteItemFromObjectCaseSensitive(g_sb_state, "entries");
+        cJSON_AddObjectToObject(g_sb_state, "entries");
+    }
+}
+
+/* Saves standby.json and the restore request, or removes both once nothing of
+ * LG's table is changed any more. */
+static cJSON *micom_payload(cJSON *table, int ours);
+
+static void standby_save_state(cJSON *table) {
+    char path[600], restore[600], restore_micom[600];
+    config_dir_file(path, sizeof path, STANDBY_STATE_NAME);
+    config_dir_file(restore, sizeof restore, STANDBY_RESTORE_NAME);
+    config_dir_file(restore_micom, sizeof restore_micom, STANDBY_RESTORE_MICOM_NAME);
+    cJSON *entries = cJSON_GetObjectItemCaseSensitive(g_sb_state, "entries");
+    int micom = cJSON_IsObject(cJSON_GetObjectItemCaseSensitive(g_sb_state, "micom"));
+    if (micom && table) {
+        cJSON *lg = micom_payload(table, 0);
+        char *t = cJSON_PrintUnformatted(lg);
+        cJSON_Delete(lg);
+        if (!t || write_file_atomic(restore_micom, t) < 0) WARN("cannot write %s: %s", restore_micom, strerror(errno));
+        free(t);
+    } else if (!micom) {
+        unlink(restore_micom);
+    }
+    if (!cJSON_GetArraySize(entries) && !micom) {
+        unlink(path);
+        unlink(restore);
+        return;
+    }
+    char *text = cJSON_PrintUnformatted(g_sb_state);
+    if (!text || write_file_atomic(path, text) < 0) WARN("cannot write %s: %s", path, strerror(errno));
+    free(text);
+    if (!table) return;
+    /* the current table with LG's values in place of ours */
+    cJSON *orig = cJSON_Duplicate(table, 1);
+    cJSON *slot;
+    cJSON_ArrayForEach(slot, orig) {
+        cJSON *rec;
+        cJSON_ArrayForEach(rec, entries) {
+            cJSON *lg = cJSON_GetObjectItemCaseSensitive(rec, "lg");
+            if (lg && cJSON_GetObjectItemCaseSensitive(slot, rec->string))
+                cJSON_ReplaceItemInObjectCaseSensitive(slot, rec->string, cJSON_Duplicate(lg, 1));
+        }
+    }
+    cJSON *req = cJSON_CreateObject();
+    cJSON_AddStringToObject(req, "category", "other");
+    cJSON_AddItemToObject(cJSON_AddObjectToObject(req, "settings"), "mapping_info", orig);
+    text = cJSON_PrintUnformatted(req);
+    cJSON_Delete(req);
+    if (!text || write_file_atomic(restore, text) < 0) WARN("cannot write %s: %s", restore, strerror(errno));
+    free(text);
+}
+
+/* The entry a mapping needs, built from LG's entry, or NULL if the mapping
+ * leaves the wake alone. *lock is set when the key must not wake the TV. */
+static cJSON *standby_want(const struct mapping *m, const cJSON *lg, int *lock) {
+    *lock = 0;
+    if (!m || !m->enabled) return NULL;
+    /* LG marks hotkeys that are not serviced in this country inactive: those
+     * already wake the TV like the power button, or do not wake it at all. */
+    if (!cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(lg, "isActive"))) return NULL;
+    const struct action *a = &m->press;
+    /* a button in a loop does nothing, like a disabled one, and so does one
+     * whose "allow from standby" is off (in standby only) */
+    enum act_type type = m->looped || !m->standby ? ACT_DISABLE : a->type;
+    /* Doing nothing includes not turning the TV on: the micom gets told to
+     * ignore the key. The entry still says "wake normally", which is what
+     * happens should the lock ever be missing. */
+    if (type == ACT_DISABLE) *lock = 1;
+    cJSON *w;
+    switch (type) {
+        case ACT_LAUNCH: {
+            w = cJSON_Duplicate(lg, 1);
+            cJSON_DeleteItemFromObjectCaseSensitive(w, "app_id");
+            cJSON_AddStringToObject(w, "app_id", a->app);
+            cJSON_DeleteItemFromObjectCaseSensitive(w, "launch_param");
+            cJSON *p = a->params ? cJSON_Parse(a->params) : NULL;
+            cJSON_AddItemToObject(w, "launch_param", p ? p : cJSON_CreateNull());
+            return w;
+        }
+        case ACT_DISABLE:
+        case ACT_REPLACE:
+        case ACT_EXEC:
+            w = cJSON_Duplicate(lg, 1);
+            cJSON_DeleteItemFromObjectCaseSensitive(w, "isActive");
+            cJSON_AddBoolToObject(w, "isActive", 0);
+            return w;
+        default:
+            return NULL;
+    }
+}
+
+static cJSON *table_slot(cJSON *table, const char *reason) {
+    cJSON *slot;
+    cJSON_ArrayForEach(slot, table)
+        if (cJSON_IsObject(cJSON_GetObjectItemCaseSensitive(slot, reason))) return slot;
+    return NULL;
+}
+
+/* What each hotkey does on a wake, read from the table as it is. */
+static void standby_update_modes(cJSON *table) {
+    cJSON *entries = cJSON_GetObjectItemCaseSensitive(g_sb_state, "entries");
+    for (int i = 0; i < NWAKE; i++) {
+        const char *reason = WAKE_KEYS[i].reason;
+        cJSON *slot = table_slot(table, reason);
+        cJSON *cur = slot ? cJSON_GetObjectItemCaseSensitive(slot, reason) : NULL;
+        cJSON *ours = cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(entries, reason), "ours");
+        int active = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(cur, "isActive"));
+        if (!cur) g_wake_mode[i] = WM_ABSENT;
+        else if (ours && cJSON_Compare(cur, ours, 1))
+            g_wake_mode[i] = active ? WM_LAUNCH
+                : cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(entries, reason), "lock")) &&
+                  cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(g_sb_state, "micom"), reason))
+                ? WM_OFF : WM_NORMAL;
+        else g_wake_mode[i] = active ? WM_LG : WM_INACTIVE;
+    }
+}
+
+/* After a failed write: forget what was not written and report the table as it is. */
+static void standby_reload(void) {
+    standby_load_state();
+    char *text = read_file(LG_PREFS_FILE);
+    cJSON *prefs = text ? cJSON_Parse(text) : NULL;
+    free(text);
+    standby_update_modes(cJSON_GetObjectItemCaseSensitive(prefs, "mapping_info"));
+    cJSON_Delete(prefs);
+}
+
+/* The micom's hotkey locks as LG's own code sends them: every key it knows,
+ * true = may wake the TV. setCPHotKeyListLock unlocks any key left out, so the
+ * list is always complete. LG's value comes from its table (from our record of
+ * LG's entry where the table holds ours); with ours set, our locks apply. */
+static cJSON *micom_payload(cJSON *table, int ours) {
+    cJSON *entries = cJSON_GetObjectItemCaseSensitive(g_sb_state, "entries");
+    cJSON *p = cJSON_CreateObject();
+    int nother = (int)(sizeof OTHER_LOCK_REASONS / sizeof OTHER_LOCK_REASONS[0]);
+    for (int i = 0; i < NWAKE + nother; i++) {
+        const char *reason = i < NWAKE ? WAKE_KEYS[i].reason : OTHER_LOCK_REASONS[i - NWAKE];
+        cJSON *slot = table_slot(table, reason);
+        cJSON *rec = cJSON_GetObjectItemCaseSensitive(entries, reason);
+        cJSON *lg = rec ? cJSON_GetObjectItemCaseSensitive(rec, "lg") : slot ? cJSON_GetObjectItemCaseSensitive(slot, reason) : NULL;
+        int active = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(lg, "isActive"));
+        if (ours && rec && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(rec, "lock"))) active = 0;
+        cJSON_AddBoolToObject(p, reason, active);
+    }
+    return p;
+}
+
+/* 1 locked, 0 not, -1 unknown. (One item per request: a batch fails as a
+ * whole if the TV lacks any of the items.) */
+static int micom_lock_value(const char *item) {
+    char payload[160];
+    snprintf(payload, sizeof payload, "{\"dbgroups\":[{\"items\":[\"%s\"],\"dbid\":\"micom\"}]}", item);
+    cJSON *r = luna_json("luna://com.webos.service.lowlevelstorage/getData", payload, 2000);
+    cJSON *groups = cJSON_GetObjectItemCaseSensitive(r, "dbgroups");
+    cJSON *v = cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(groups, 0), "items"), item);
+    int val = cJSON_IsNumber(v) ? (v->valueint != 0) : -1;
+    cJSON_Delete(r);
+    return val;
+}
+
+/* Locks the keys of "do nothing" mappings in the micom so they do not wake the
+ * TV, and gives the locks back to LG once no mapping needs them. LG unlocks
+ * them after a reboot (with the same server sync that resets the table), so
+ * our locks are checked whenever the table changes. */
+static int standby_micom_sync(cJSON *table, int *state_changed) {
+    cJSON *entries = cJSON_GetObjectItemCaseSensitive(g_sb_state, "entries");
+    cJSON *sent = cJSON_GetObjectItemCaseSensitive(g_sb_state, "micom");
+    int want = 0;
+    cJSON *rec;
+    cJSON_ArrayForEach(rec, entries) if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(rec, "lock"))) want = 1;
+    if (!want && !sent) return 0; /* the micom is LG's alone */
+    cJSON *payload = micom_payload(table, 1);
+    int need = !sent || !cJSON_Compare(sent, payload, 1);
+    for (int i = 0; i < NWAKE && !need && want; i++) {
+        rec = cJSON_GetObjectItemCaseSensitive(entries, WAKE_KEYS[i].reason);
+        if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(rec, "lock")) && micom_lock_value(WAKE_KEYS[i].lock) == 0) {
+            LOG("the TV unlocked '%s' in the micom, locking it again", WAKE_KEYS[i].reason);
+            need = 1;
+        }
+    }
+    if (need) {
+        char *text = cJSON_PrintUnformatted(payload);
+        cJSON *res = text ? luna_json("luna://com.webos.service.micomservice/setCPHotKeyListLock", text, 5000) : NULL;
+        free(text);
+        if (!res) {
+            snprintf(g_sb_error, sizeof g_sb_error, "could not update the TV's standby key locks; retrying");
+            ERR("%s", g_sb_error);
+            cJSON_Delete(payload);
+            g_sb_retry_at = mono_ms() + 30000;
+            return -1;
+        }
+        cJSON_Delete(res);
+        LOG(want ? "standby key locks updated" : "standby key locks given back to LG");
+    }
+    if (want) {
+        if (need) {
+            cJSON_DeleteItemFromObjectCaseSensitive(g_sb_state, "micom");
+            cJSON_AddItemToObject(g_sb_state, "micom", payload);
+            *state_changed = 1;
+            payload = NULL;
+        }
+    } else {
+        cJSON_DeleteItemFromObjectCaseSensitive(g_sb_state, "micom");
+        *state_changed = 1;
+    }
+    cJSON_Delete(payload);
+    return 0;
+}
+
+/* Brings LG's hotkey table in line with the mappings (release_all: give every
+ * entry back to LG). Returns 0 when the table is as it should be. */
+static int standby_sync(int release_all) {
+    if (g_dry_run) return 0;
+    if (g_sb_paused && !release_all) return 0;
+    g_sb_retry_at = 0;
+    char *text = read_file(LG_PREFS_FILE);
+    cJSON *prefs = text ? cJSON_Parse(text) : NULL;
+    free(text);
+    cJSON *table = cJSON_GetObjectItemCaseSensitive(prefs, "mapping_info");
+    if (!cJSON_IsArray(table)) {
+        for (int i = 0; i < NWAKE; i++) g_wake_mode[i] = WM_ABSENT;
+        if (!cJSON_IsObject(prefs)) {
+            /* missing or being rewritten: look again later */
+            snprintf(g_sb_error, sizeof g_sb_error, "the TV's hotkey table (%s) is not readable", LG_PREFS_FILE);
+            g_sb_retry_at = mono_ms() + 60000;
+        } else {
+            g_sb_error[0] = 0; /* this TV has no such table (webOS 5 and older) */
+        }
+        cJSON_Delete(prefs);
+        return -1;
+    }
+
+    cJSON *entries = cJSON_GetObjectItemCaseSensitive(g_sb_state, "entries");
+    int changed = 0, state_changed = 0, lg_reset = 0;
+    for (int i = 0; i < NWAKE; i++) {
+        const char *reason = WAKE_KEYS[i].reason;
+        cJSON *slot = table_slot(table, reason);
+        cJSON *cur = slot ? cJSON_GetObjectItemCaseSensitive(slot, reason) : NULL;
+        cJSON *rec = cJSON_GetObjectItemCaseSensitive(entries, reason);
+        if (!cur) {
+            if (rec) { cJSON_DeleteItemFromObjectCaseSensitive(entries, reason); state_changed = 1; }
+            continue;
+        }
+        cJSON *ours = rec ? cJSON_GetObjectItemCaseSensitive(rec, "ours") : NULL;
+        if (rec && !cJSON_Compare(cur, ours, 1)) {
+            /* Not what we wrote: the TV set it (LG's server resets the table
+             * after a reboot), so this is LG's value now. */
+            cJSON_ReplaceItemInObjectCaseSensitive(rec, "lg", cJSON_Duplicate(cur, 1));
+            state_changed = 1;
+            lg_reset = 1;
+        }
+        cJSON *lg = rec ? cJSON_GetObjectItemCaseSensitive(rec, "lg") : cur;
+        const struct mapping *m = release_all ? NULL : g_cfg.by_key[WAKE_KEYS[i].key];
+        int lock;
+        cJSON *want = standby_want(m, lg, &lock);
+        if (want) {
+            if (!rec) {
+                rec = cJSON_AddObjectToObject(entries, reason);
+                cJSON_AddItemToObject(rec, "lg", cJSON_Duplicate(cur, 1));
+                state_changed = 1;
+            }
+            if (!cJSON_Compare(cur, want, 1)) {
+                cJSON_ReplaceItemInObjectCaseSensitive(slot, reason, cJSON_Duplicate(want, 1));
+                changed = 1;
+            }
+            if (!cJSON_Compare(cJSON_GetObjectItemCaseSensitive(rec, "ours"), want, 1)) {
+                cJSON_DeleteItemFromObjectCaseSensitive(rec, "ours");
+                cJSON_AddItemToObject(rec, "ours", cJSON_Duplicate(want, 1));
+                state_changed = 1;
+            }
+            if (lock != cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(rec, "lock"))) {
+                cJSON_DeleteItemFromObjectCaseSensitive(rec, "lock");
+                if (lock) cJSON_AddBoolToObject(rec, "lock", 1);
+                state_changed = 1;
+            }
+            cJSON_Delete(want);
+        } else {
+            if (rec) {
+                if (cJSON_Compare(cur, cJSON_GetObjectItemCaseSensitive(rec, "ours"), 1)) {
+                    cJSON_ReplaceItemInObjectCaseSensitive(slot, reason, cJSON_Duplicate(lg, 1));
+                    changed = 1;
+                }
+                cJSON_DeleteItemFromObjectCaseSensitive(entries, reason);
+                state_changed = 1;
+            }
+        }
+    }
+
+    if (changed) {
+        int64_t now = mono_ms();
+        if (now - g_sb_window_start > 10 * 60 * 1000) { g_sb_window_start = now; g_sb_window_writes = 0; }
+        if (++g_sb_window_writes > 10 && !release_all) {
+            /* Something keeps putting the table back: stop fighting over it. */
+            snprintf(g_sb_error, sizeof g_sb_error, "the TV keeps changing its hotkey table back; standby remapping paused until the mappings change");
+            ERR("%s", g_sb_error);
+            g_sb_paused = 1;
+            standby_reload();
+            cJSON_Delete(prefs);
+            return -1;
+        }
+        cJSON *req = cJSON_CreateObject();
+        cJSON_AddStringToObject(req, "category", "other");
+        cJSON_AddItemReferenceToObject(cJSON_AddObjectToObject(req, "settings"), "mapping_info", table);
+        char *payload = cJSON_PrintUnformatted(req);
+        cJSON_Delete(req);
+        cJSON *res = payload ? luna_json("luna://com.webos.settingsservice/setSystemSettings", payload, 5000) : NULL;
+        free(payload);
+        if (!res) {
+            snprintf(g_sb_error, sizeof g_sb_error, "could not update the TV's hotkey table; retrying");
+            ERR("%s", g_sb_error);
+            standby_reload();
+            cJSON_Delete(prefs);
+            g_sb_retry_at = mono_ms() + 30000;
+            return -1;
+        }
+        cJSON_Delete(res);
+        LOG("hotkey table updated for standby wakes");
+    }
+    int micom_rc = standby_micom_sync(table, &state_changed);
+    /* LG's sync sends the key locks right after the table: look at ours again
+     * once that has landed. */
+    if (lg_reset && micom_rc == 0 && !release_all) g_sb_recheck_at = mono_ms() + 10000;
+    if (changed || state_changed) standby_save_state(table);
+    standby_update_modes(table);
+    if (!g_sb_paused && micom_rc == 0) g_sb_error[0] = 0;
+    cJSON_Delete(prefs);
+    return micom_rc;
+}
+
+/* Gives LG's table back and forgets our changes (stop, uninstall).
+ * Returns 0 once the TV is LG's again. */
+static int standby_release(void) {
+    if (standby_sync(1) != 0) return -1;
+    char path[600];
+    config_dir_file(path, sizeof path, STANDBY_STATE_NAME); unlink(path);
+    config_dir_file(path, sizeof path, STANDBY_RESTORE_NAME); unlink(path);
+    config_dir_file(path, sizeof path, STANDBY_RESTORE_MICOM_NAME); unlink(path);
+    return 0;
+}
+
+static void standby_status(cJSON *root) {
+    cJSON *sb = cJSON_AddObjectToObject(root, "standby");
+    cJSON_AddBoolToObject(sb, "enabled", !g_dry_run);
+    cJSON_AddStringToObject(sb, "error", g_sb_error);
+    cJSON *keys = cJSON_AddObjectToObject(sb, "keys");
+    for (int i = 0; i < NWAKE; i++) {
+        if (g_wake_mode[i] == WM_ABSENT) continue;
+        char k[16];
+        snprintf(k, sizeof k, "%d", WAKE_KEYS[i].key);
+        cJSON *j = cJSON_AddObjectToObject(keys, k);
+        cJSON_AddStringToObject(j, "reason", WAKE_KEYS[i].reason);
+        cJSON_AddStringToObject(j, "wake", WAKE_MODE_NAMES[g_wake_mode[i]]);
+    }
+    if (g_last_wake.at) {
+        cJSON *w = cJSON_AddObjectToObject(sb, "lastWake");
+        cJSON_AddStringToObject(w, "reason", g_last_wake.reason);
+        cJSON_AddNumberToObject(w, "at", (double)g_last_wake.at);
+        if (g_last_wake.key) cJSON_AddNumberToObject(w, "key", g_last_wake.key);
+        cJSON_AddStringToObject(w, "action", g_last_wake.action ? g_last_wake.action : "none");
+    }
+}
+
+/* Replace and exec mappings of wake hotkeys act after the wake; the others are
+ * handled by the table alone. */
+static int standby_has_wake_actions(void) {
+    if (g_dry_run) return 0;
+    for (int i = 0; i < NWAKE; i++) {
+        const struct mapping *m = g_cfg.by_key[WAKE_KEYS[i].key];
+        if (m && m->enabled && !m->looped && m->standby && (m->press.type == ACT_REPLACE || m->press.type == ACT_EXEC)) return 1;
+    }
+    return 0;
+}
+
+static void standby_start_wake(void) {
+    if (!standby_has_wake_actions() && !g_standby_press_key) return;
+    memset(&g_wake, 0, sizeof g_wake);
+    g_wake.active = 1;
+    g_wake.next = mono_ms() + 500;
+    g_wake.until = mono_ms() + 30000;
+}
+
+/* Wakes are noticed through tvpower's power state: a luna-send subscription
+ * runs alongside while any mapping needs to act after a wake. (The C5 does
+ * suspend in standby, but its CLOCK_BOOTTIME does not count the time asleep,
+ * so the clocks cannot tell.) */
+static struct {
+    int fd;                /* luna-send's stdout, -1 when not running */
+    pid_t pid;
+    int64_t restart_at;    /* mono ms */
+    char line[1024];
+    size_t len;
+    char state[40];        /* last power state reported */
+} g_pw = { .fd = -1 };
+
+static int is_standby_state(const char *s) {
+    return strstr(s, "Standby") || strstr(s, "Suspend") || !strcmp(s, "Power Off");
+}
+
+static void power_watch_stop(void) {
+    if (g_pw.fd < 0) return;
+    if (g_pw.pid > 0) kill(g_pw.pid, SIGTERM);
+    close(g_pw.fd);
+    g_pw.fd = -1;
+    g_pw.pid = 0;
+    g_pw.len = 0;
+    g_pw.state[0] = 0;
+}
+
+static void power_watch_start(void) {
+    int pfd[2];
+    if (pipe2(pfd, O_CLOEXEC) < 0) { WARN("pipe: %s", strerror(errno)); return; }
+    pid_t pid = fork();
+    if (pid < 0) { WARN("fork failed: %s", strerror(errno)); close(pfd[0]); close(pfd[1]); return; }
+    if (pid == 0) {
+        prctl(PR_SET_PDEATHSIG, SIGTERM);
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) { dup2(devnull, 0); dup2(devnull, 2); }
+        dup2(pfd[1], 1);
+        signal(SIGCHLD, SIG_DFL);
+        char *argv[] = { "luna-send", "-i", "luna://com.webos.service.tvpower/power/getPowerState",
+                         "{\"subscribe\":true}", NULL };
+        execv("/usr/bin/luna-send", argv);
+        execvp("luna-send", argv);
+        _exit(127);
+    }
+    close(pfd[1]);
+    fcntl(pfd[0], F_SETFL, O_NONBLOCK);
+    g_pw.fd = pfd[0];
+    g_pw.pid = pid;
+    g_pw.len = 0;
+    g_pw.state[0] = 0;
+}
+
+/* The watcher is needed while any hotkey's wake is ours: in active standby
+ * those keys reach the daemon, which then turns the TV on itself. */
+static int standby_needs_watch(void) {
+    if (g_dry_run) return 0;
+    for (int i = 0; i < NWAKE; i++)
+        if (g_wake_mode[i] == WM_LAUNCH || g_wake_mode[i] == WM_NORMAL || g_wake_mode[i] == WM_OFF) return 1;
+    return standby_has_wake_actions();
+}
+
+/* Runs the watcher exactly while it is needed. */
+static void power_watch_update(void) {
+    int want = standby_needs_watch();
+    if (!want) { power_watch_stop(); return; }
+    if (g_pw.fd < 0 && mono_ms() >= g_pw.restart_at) power_watch_start();
+}
+
+static void power_watch_line(char *line) {
+    cJSON *r = cJSON_Parse(line);
+    cJSON *st = cJSON_GetObjectItemCaseSensitive(r, "state");
+    if (cJSON_IsString(st)) {
+        if (g_pw.state[0] && is_standby_state(g_pw.state) && !strcmp(st->valuestring, "Active")) {
+            LOG("the TV turned on (was '%s')", g_pw.state);
+            standby_start_wake();
+        }
+        snprintf(g_pw.state, sizeof g_pw.state, "%s", st->valuestring);
+    }
+    cJSON_Delete(r);
+}
+
+static void power_watch_read(void) {
+    for (;;) {
+        if (g_pw.len >= sizeof g_pw.line - 1) g_pw.len = 0; /* an absurd line: drop it */
+        ssize_t n = read(g_pw.fd, g_pw.line + g_pw.len, sizeof g_pw.line - 1 - g_pw.len);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && errno == EAGAIN) return;
+        if (n <= 0) {
+            WARN("power state subscription ended, restarting it in 10 s");
+            power_watch_stop();
+            g_pw.restart_at = mono_ms() + 10000;
+            return;
+        }
+        g_pw.len += (size_t)n;
+        g_pw.line[g_pw.len] = 0;
+        char *nl;
+        while ((nl = strchr(g_pw.line, '\n'))) {
+            *nl = 0;
+            power_watch_line(g_pw.line);
+            size_t rest = g_pw.len - (size_t)(nl + 1 - g_pw.line);
+            memmove(g_pw.line, nl + 1, rest + 1);
+            g_pw.len = rest;
+        }
+    }
+}
+
+static void standby_poll_wake(void) {
+    if (!g_wake.active || mono_ms() < g_wake.next) return;
+    if (g_wake.stage == 0) {
+        /* tvpowerd sets the power-on reason before the TV turns active. */
+        cJSON *r = luna_json("luna://com.webos.service.tvpower/power/getPowerState", "{}", 2000);
+        cJSON *st = cJSON_GetObjectItemCaseSensitive(r, "state");
+        int ready = cJSON_IsString(st) && !strcmp(st->valuestring, "Active") &&
+                    !cJSON_GetObjectItemCaseSensitive(r, "processing");
+        cJSON_Delete(r);
+        if (!ready) {
+            if (mono_ms() > g_wake.until) { LOG("the TV did not turn active, no wake action"); g_wake.active = 0; }
+            else g_wake.next = mono_ms() + 1000;
+            return;
+        }
+        r = luna_json("luna://com.webos.service.tvpower/power/getPowerOnReason", "{}", 2000);
+        cJSON *rs = cJSON_GetObjectItemCaseSensitive(r, "reason");
+        memset(&g_last_wake, 0, sizeof g_last_wake);
+        snprintf(g_last_wake.reason, sizeof g_last_wake.reason, "%s", cJSON_IsString(rs) ? rs->valuestring : "?");
+        g_last_wake.at = now_ms();
+        cJSON_Delete(r);
+        g_wake.active = 0;
+        int key = 0, missed = 0;
+        for (int i = 0; i < NWAKE && !key; i++)
+            if (!strcmp(WAKE_KEYS[i].reason, g_last_wake.reason)) key = WAKE_KEYS[i].key;
+        if (g_standby_press_key && mono_ms() - g_standby_press_at < 30000 && key != g_standby_press_key) {
+            /* we turned the TV on for this key but tvpower recorded something
+             * else, so bootd did not act on it either: do it all here */
+            key = g_standby_press_key;
+            missed = 1;
+        }
+        g_standby_press_key = 0;
+        const struct mapping *m = key ? g_cfg.by_key[key] : NULL;
+        if (m && m->enabled && !m->looped && m->standby) {
+            g_last_wake.key = m->key;
+            if (m->press.type == ACT_REPLACE || m->press.type == ACT_EXEC || (missed && m->press.type == ACT_LAUNCH)) {
+                /* let the app the TV resumes into settle first */
+                g_wake.active = 1;
+                g_wake.stage = 1;
+                g_wake.key = m->key;
+                g_wake.next = mono_ms() + 1500;
+                g_wake.until = mono_ms() + 10000;
+            }
+        }
+        LOG("woken by '%s'%s", g_last_wake.reason, g_wake.active ? ", running its mapping" : "");
+        write_status();
+        return;
+    }
+    const struct mapping *m = g_cfg.by_key[g_wake.key];
+    g_wake.active = 0;
+    if (!m || !m->enabled || m->looped) return;
+    if (m->press.type == ACT_LAUNCH) {
+        run_launch(m->press.app, m->press.params, m->key);
+        g_last_wake.action = "launch";
+    } else if (m->press.type == ACT_EXEC) {
+        setenv("LGINPUTMAPPER_WAKE", "1", 1);
+        run_exec(m->press.command, m->key, 1);
+        unsetenv("LGINPUTMAPPER_WAKE");
+        g_last_wake.action = "exec";
+    } else if (m->press.type == ACT_REPLACE) {
+        struct device *out = NULL;
+        for (int i = 0; i < MAX_DEVS && !out; i++) {
+            struct device *d = &g_devs[i];
+            if (d->fd >= 0 && d->out_fd >= 0 && (d->out_is_clone || TEST_BIT(m->press.to, d->out_keybits))) out = d;
+        }
+        if (!out) {
+            if (mono_ms() < g_wake.until) { g_wake.active = 1; g_wake.next = mono_ms() + 1000; return; }
+            WARN("no output device to send key %d after the wake", m->press.to);
+            return;
+        }
+        LOG("key %d after wake: acts as %d", m->key, m->press.to);
+        out_tap(out, m->press.to);
+        g_last_wake.action = "replace";
+    }
+    write_status();
+}
+
+/* Called for every key press: in active standby (the SoC is up, so remote
+ * keys reach the input devices rather than the micom), a hotkey whose wake
+ * is ours powers the TV on with that hotkey as the reason. bootd then does
+ * what the table says, exactly as after a wake from suspend, and the wake
+ * handler runs "acts as" and command mappings. */
+static int standby_wake_key_pressed(int code) {
+    if (g_dry_run || g_pw.fd < 0 || !g_pw.state[0] || !is_standby_state(g_pw.state)) return 0;
+    int i;
+    for (i = 0; i < NWAKE && WAKE_KEYS[i].key != code; i++) {}
+    if (i == NWAKE || (g_wake_mode[i] != WM_LAUNCH && g_wake_mode[i] != WM_NORMAL && g_wake_mode[i] != WM_OFF)) return 0;
+    if (g_wake_mode[i] == WM_OFF) {
+        LOG("key %d pressed while the TV is in '%s': it does nothing", code, g_pw.state);
+        return 1;
+    }
+    LOG("key %d pressed while the TV is in '%s': turning it on as a '%s' wake", code, g_pw.state, WAKE_KEYS[i].reason);
+    g_standby_press_key = code;
+    g_standby_press_at = mono_ms();
+    char payload[64];
+    snprintf(payload, sizeof payload, "{\"reason\":\"%s\"}", WAKE_KEYS[i].reason);
+    char *argv[] = { "luna-send", "-n", "1", "luna://com.webos.service.tvpower/power/powerOn", payload, NULL };
+    run_detached(argv, code, 1);
+    return 1;
+}
+
+/* When the package is uninstalled the daemon keeps running from the deleted
+ * binary: give LG's hotkey table back, remove the boot script and quit. */
+static void check_installed(void) {
+    if (!g_install_dir[0] || mono_ms() < g_install_next_check) return;
+    g_install_next_check = mono_ms() + 15000;
+    struct stat st;
+    if (stat(g_install_dir, &st) == 0) { g_install_missing_since = 0; return; }
+    if (!g_install_missing_since) {
+        /* an update replaces the directory too: give it time to come back */
+        g_install_missing_since = mono_ms();
+        LOG("%s is gone, checking whether LG Input Mapper was uninstalled", g_install_dir);
+        return;
+    }
+    if (mono_ms() - g_install_missing_since < 60000) return;
+    LOG("LG Input Mapper was uninstalled: giving the TV's hotkeys back, removing our files and exiting");
+    if (standby_release() == 0) {
+        char *script = read_file(INIT_SCRIPT);
+        if (script && strstr(script, g_install_dir)) unlink(INIT_SCRIPT);
+        free(script);
+        g_uninstalled = 1;
+    } else {
+        /* the boot script still has the restore requests: it retries at the next boot */
+        WARN("could not give the hotkeys back now; the boot script will at the next boot");
+    }
+    g_quit = 1;
+}
+
+/* Empties and removes one of our own directories. Only a directory named
+ * like ours is touched, whatever --config or --state-dir pointed at. */
+static void remove_own_dir(const char *dir, const char *expected_name) {
+    const char *base = strrchr(dir, '/');
+    base = base ? base + 1 : dir;
+    if (strcmp(base, expected_name)) { WARN("not removing %s: not our directory", dir); return; }
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *de;
+    while ((de = readdir(d))) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        if (unlinkat(dirfd(d), de->d_name, 0) < 0) WARN("cannot remove %s/%s: %s", dir, de->d_name, strerror(errno));
+    }
+    closedir(d);
+    if (rmdir(dir) < 0) WARN("cannot remove %s: %s", dir, strerror(errno));
+}
+
+static void find_install_dir(void) {
+    char exe[512];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    if (n <= 0) return;
+    exe[n] = 0;
+    char *del = strstr(exe, " (deleted)");
+    if (del) *del = 0;
+    if (!strstr(exe, "/usr/palm/services/")) return;  /* a development copy */
+    char *slash = strrchr(exe, '/');                  /* .../<service>/bin/lginputmapperd-arm */
+    if (slash) *slash = 0;
+    slash = strrchr(exe, '/');
+    if (slash) *slash = 0;
+    snprintf(g_install_dir, sizeof g_install_dir, "%s", exe);
+}
+
 /* ---------------------------------------------------------------- main */
 
+static volatile sig_atomic_t g_release = 0;
+
 static void on_signal(int sig) {
-    (void)sig;
+    /* SIGUSR2 comes from the service when the remapper is turned off: give the
+     * TV's hotkeys back too. A plain SIGTERM (reboot, --replace) keeps them. */
+    if (sig == SIGUSR2) g_release = 1;
     g_quit = 1;
 }
 
@@ -1482,11 +2383,12 @@ int main(int argc, char **argv) {
 
     if (state_moved) WARN("%s was not ours, moved it aside", g_state_dir);
     {
-        char cdir[512];
-        snprintf(cdir, sizeof cdir, "%s", g_config_path);
-        char *slash = strrchr(cdir, '/');
-        if (slash) { *slash = 0; mkdir_p(cdir, 0700); }
+        snprintf(g_config_dir, sizeof g_config_dir, "%s", g_config_path);
+        char *slash = strrchr(g_config_dir, '/');
+        if (slash) { *slash = 0; mkdir_p(g_config_dir, 0700); }
+        else snprintf(g_config_dir, sizeof g_config_dir, ".");
     }
+    find_install_dir();
 
     int lock_fd = acquire_lock(replace);
     if (lock_fd < 0) return 1;
@@ -1501,6 +2403,7 @@ int main(int argc, char **argv) {
     signal(SIGTERM, on_signal);
     signal(SIGINT, on_signal);
     signal(SIGHUP, on_signal);
+    signal(SIGUSR2, on_signal);
 
     g_started_ms = now_ms();
     for (int i = 0; i < MAX_DEVS; i++) { g_devs[i].fd = -1; g_devs[i].out_fd = -1; }
@@ -1519,21 +2422,30 @@ int main(int argc, char **argv) {
     int ino = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
     if (ino < 0) { ERR("inotify_init: %s", strerror(errno)); return 1; }
     int w_dev = inotify_add_watch(ino, DEV_INPUT, IN_CREATE | IN_DELETE | IN_ATTRIB);
-    char cdir[512];
-    snprintf(cdir, sizeof cdir, "%s", g_config_path);
-    { char *slash = strrchr(cdir, '/'); if (slash) *slash = 0; }
     const char *cfg_base = strrchr(g_config_path, '/');
     cfg_base = cfg_base ? cfg_base + 1 : g_config_path;
-    int w_cfg = inotify_add_watch(ino, cdir, IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE | IN_DELETE);
+    int w_cfg = inotify_add_watch(ino, g_config_dir, IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE | IN_DELETE);
     int w_state = inotify_add_watch(ino, g_state_dir, IN_CLOSE_WRITE | IN_MOVED_TO | IN_DELETE);
-    if (w_dev < 0 || w_cfg < 0 || w_state < 0) WARN("inotify watches incomplete (%s)", strerror(errno));
+    /* the settings service rewrites this file whenever LG's hotkey table changes */
+    int w_prefs = g_dry_run ? -2 : inotify_add_watch(ino, LG_PREFS_DIR, IN_CLOSE_WRITE | IN_MOVED_TO);
+    if (w_dev < 0 || w_cfg < 0 || w_state < 0 || w_prefs == -1) WARN("inotify watches incomplete (%s)", strerror(errno));
 
     scan_devices();
+    if (!g_dry_run) {
+        standby_load_state();
+        standby_sync(0);
+        power_watch_update();
+        /* Started at boot: a hotkey may have been what turned the TV on. */
+        char marker[600];
+        snprintf(marker, sizeof marker, "%s/boot-wake-checked", g_state_dir);
+        int mfd = boot_ms() < 180000 ? open(marker, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600) : -1;
+        if (mfd >= 0) { close(mfd); standby_start_wake(); }
+    }
     write_status();
 
     struct pollfd pfds[MAX_DEVS + 1];
     int64_t last_scan = mono_ms();
-    int reload_cfg = 0, rescan = 0, status_dirty = 0;
+    int reload_cfg = 0, rescan = 0, status_dirty = 0, sync_standby = 0;
 
     while (!g_quit) {
         int n = 0;
@@ -1544,9 +2456,27 @@ int main(int argc, char **argv) {
             map[n] = &g_devs[i];
             pfds[n].fd = g_devs[i].fd; pfds[n].events = POLLIN; n++;
         }
+        int pw_idx = -1;
+        if (g_pw.fd >= 0) { pw_idx = n; pfds[n].fd = g_pw.fd; pfds[n].events = POLLIN; n++; }
         int timeout = next_timeout_ms();
         if (rescan) timeout = 500; /* devices are still settling; poll again soon */
         if (timeout < 0 || timeout > 30000) timeout = 30000;
+        if (g_pw.fd < 0 && g_pw.restart_at && standby_needs_watch()) {
+            int64_t left = g_pw.restart_at - mono_ms();
+            if (left < timeout) timeout = left < 0 ? 0 : (int)left;
+        }
+        if (g_wake.active) {
+            int64_t left = g_wake.next - mono_ms();
+            if (left < timeout) timeout = left < 0 ? 0 : (int)left;
+        }
+        if (g_sb_retry_at) {
+            int64_t left = g_sb_retry_at - mono_ms();
+            if (left < timeout) timeout = left < 0 ? 0 : (int)left;
+        }
+        if (g_sb_recheck_at) {
+            int64_t left = g_sb_recheck_at - mono_ms();
+            if (left < timeout) timeout = left < 0 ? 0 : (int)left;
+        }
 
         int rc = poll(pfds, (nfds_t)n, timeout);
         if (rc < 0) {
@@ -1567,13 +2497,18 @@ int main(int argc, char **argv) {
                         if (ev->len && !strcmp(ev->name, cfg_base)) reload_cfg = 1;
                     } else if (ev->wd == w_state) {
                         if (ev->len && !strcmp(ev->name, "capture.json")) { apply_capture(); status_dirty = 1; }
+                    } else if (ev->wd == w_prefs) {
+                        if (ev->len && !strcmp(ev->name, LG_PREFS_NAME)) sync_standby = 1;
                     }
                     p += sizeof *ev + ev->len;
                 }
             }
         }
 
+        if (pw_idx >= 0 && (pfds[pw_idx].revents & (POLLIN | POLLERR | POLLHUP))) power_watch_read();
+
         for (int i = 1; i < n; i++) {
+            if (i == pw_idx) continue;
             if (pfds[i].revents & (POLLIN | POLLERR | POLLHUP)) {
                 if (map[i]->fd < 0) continue;
                 if ((pfds[i].revents & (POLLERR | POLLHUP)) && !(pfds[i].revents & POLLIN)) {
@@ -1608,9 +2543,24 @@ int main(int argc, char **argv) {
                     if (output_changed || !name_matches(g_devs[i].name)) close_device(&g_devs[i]);
                 }
                 rescan = 1;
+                g_sb_paused = 0;
+                sync_standby = 1;
             }
             free(had_dev);
             status_dirty = 1;
+        }
+
+        if (!g_dry_run) {
+            power_watch_update();
+            int recheck_due = g_sb_recheck_at && mono_ms() >= g_sb_recheck_at;
+            if (sync_standby || (g_sb_retry_at && mono_ms() >= g_sb_retry_at) || recheck_due) {
+                sync_standby = 0;
+                if (recheck_due) g_sb_recheck_at = 0;
+                standby_sync(0);
+                status_dirty = 1;
+            }
+            standby_poll_wake();
+            check_installed();
         }
 
         if (rescan) {
@@ -1630,8 +2580,18 @@ int main(int argc, char **argv) {
     }
 
     LOG("shutting down");
+    if (g_release && !g_dry_run) {
+        LOG("remapper turned off: giving the TV's hotkeys back");
+        if (standby_release() != 0) WARN("could not give the hotkeys back; LG's own sync restores them after the next reboot");
+    }
+    power_watch_stop();
     for (int i = 0; i < MAX_DEVS; i++) close_device(&g_devs[i]);
     if (pid_path) unlink(pid_path);
     close(lock_fd);
+    if (g_uninstalled) {
+        /* uninstalled: leave nothing behind, the mappings included */
+        remove_own_dir(g_config_dir, "lginputmapper");
+        remove_own_dir(g_state_dir, "lginputmapperd");
+    }
     return 0;
 }

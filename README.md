@@ -10,6 +10,8 @@ webOS TV, using nothing but the remote:
     launch an app, switch to an input, or run a command (as root; with presets)
   - optionally a **different action when held** (long press), or a hold action
     only, leaving the normal press alone
+- Buttons that **turn the TV on** (Netflix, Prime Video, LG Channels, …) follow
+  your mappings when pressed in standby too.
 - Key monitor to see the code of any button (buttons are held back while it is open).
 - Starts at boot via Homebrew Channel; changes apply instantly.
 
@@ -28,15 +30,38 @@ script.
 Some buttons are deliberately not remappable so the TV stays usable: the
 D-pad, OK, Back, Home, Settings, Power, volume and channel.
 
-## Limitations
+## Buttons that turn the TV on
 
-**Waking the TV from standby.** A hotkey (Netflix, LG Channels, …) pressed while
-the TV is in standby keeps its original meaning: the TV turns on and launches
-that app, even if the button is remapped. The wake-up key is handled by the
-TV's power-management firmware, which powers the TV on and launches the app
-from the recorded wake reason; it never reaches the remote's input device, so
-there is nothing for the remapper to intercept. Once the TV is on, the button
-behaves as mapped.
+Streaming buttons such as Netflix, Prime Video, Disney+ or LG Channels also
+turn the TV on from standby. Your mapping decides what happens then:
+
+| Mapped to | Pressed while the TV is in standby |
+|---|---|
+| Launch an app, switch to an input | The TV turns on straight into that app or input |
+| Do nothing | Nothing: the TV stays off |
+| Act as another button, run a command | The TV turns on like the power button, and the button or command follows once it is on (a couple of seconds) |
+
+These mappings also have an **Allow from standby** option, on by default. Turn
+it off and the button no longer turns the TV on, while it keeps doing its
+mapping when the TV is on.
+
+Needs webOS 6 (2021) or newer; older TVs keep LG's behaviour for these buttons.
+Other buttons (Alexa, the colour buttons, …) cannot turn the TV on, and neither
+can streaming buttons LG does not use in your country: the app marks their
+mappings *From standby: not supported*.
+
+Nothing is left behind: removing a mapping or stopping the remapper gives
+these buttons back their original behaviour, and uninstalling the app does that
+and also deletes everything it stored, your mappings included. If a firmware
+update removes root, LG's own servers restore the buttons the first time the
+TV starts up online.
+
+## Loops
+
+Mappings that point at each other through **Act as another button** (Netflix
+acts as LG Channels, LG Channels acts as Netflix) form a loop. They stay in the
+list, shown in red, and those buttons do nothing, in standby too, until you
+delete or change one of them.
 
 ## Install
 
@@ -73,6 +98,36 @@ breaks whenever LG changes glibc. LG Input Mapper does not touch any LG process:
 3. Long presses are detected in the daemon (the remote sends no repeat events),
    exec/launch actions are spawned detached, and the config file is watched
    with inotify so changes apply instantly.
+4. A button pressed in standby never reaches the input device: the TV's standby
+   controller wakes it with a reason named after the button (`netflix`,
+   `lgchannels`, …) and the boot manager (`bootd`) opens the app listed for that
+   reason in the TV setting `other.mapping_info`, which it reads from
+   `/var/luna/preferences/other` on every wake. The daemon rewrites only the
+   entries of remapped buttons, through the settings service: launch mappings
+   get their app, anything else `isActive: false`, which wakes the TV like the
+   power button. For "do nothing" (and **Allow from standby** off) the button
+   is also locked in the standby controller, the way LG blocks buttons it does
+   not use in a country (`micomservice/setCPHotKeyListLock`; that call unlocks
+   every button left out of its list, so it always gets LG's full list with
+   only our locks changed). LG's own entries and locks are kept in
+   `standby.json` and written back as soon as a mapping no longer needs the
+   change. LG's server resets the table and lifts the locks after every reboot;
+   the daemon notices (inotify) and applies its entries and locks again.
+   For "act as" and command mappings the daemon follows tvpower's power state
+   (a `luna-send -i` subscription) and, when the TV goes from standby to
+   active, asks tvpower for the wake reason. (The clocks cannot tell: the C5
+   does suspend, but its `CLOCK_BOOTTIME` leaves the time asleep out.)
+   For a while after being turned off the TV can stay in *active standby*
+   (screen dark, system up); remote buttons then reach the daemon instead of
+   the standby controller, so for a remapped button the daemon turns the TV on
+   itself (`tvpower/power/powerOn` with the button's reason) and the wake goes
+   on as above, or drops the press if the button does nothing in standby.
+   If the app is uninstalled, the daemon keeps running from the deleted binary
+   long enough to restore LG's entries and locks, remove its boot script, its
+   config directory and its state directory, and exit; should it not get the
+   chance, the boot script sends the prepared restore requests
+   (`standby-restore.json`, `standby-restore-micom.json`) at the next boot,
+   then removes the config directory and itself.
 
 Layout:
 
@@ -84,8 +139,9 @@ Layout:
 - `frontend/` – the TV app: vanilla JS with D-pad spatial navigation.
 - `shared/keys.js` – known button codes (verified on an MR25GA).
 
-Runtime files: config `/home/root/.config/lginputmapper/config.json`,
-state `/tmp/lginputmapperd/{status.json,daemon.log,service.log}`,
+Runtime files: config `/home/root/.config/lginputmapper/config.json`
+(plus `standby.json` and the `standby-restore*.json` requests next to it
+while the TV's hotkey table or key locks are changed), state `/tmp/lginputmapperd/{status.json,daemon.log,service.log}`,
 boot script `/var/lib/webosbrew/init.d/lginputmapper`. Button presses are only
 written down (`events.jsonl`) while the key picker or the key monitor is open,
 and the file is deleted when it closes.
@@ -117,7 +173,9 @@ root-only.
 
 Action types: `pass`, `disable`, `replace` (`to`), `launch` (`app`, optional
 `params`), `exec` (`command`, optional `onRelease`). Commands get
-`LGINPUTMAPPER_KEY` and `LGINPUTMAPPER_VALUE` in their environment.
+`LGINPUTMAPPER_KEY` and `LGINPUTMAPPER_VALUE` in their environment, and
+`LGINPUTMAPPER_WAKE=1` when they run because the button woke the TV.
+`"standby": false` on a mapping is **Allow from standby** turned off.
 
 ## Building
 

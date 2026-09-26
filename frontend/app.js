@@ -3,6 +3,7 @@
 var api = require('./api');
 var nav = require('./nav');
 var keys = require('../shared/keys');
+var findLoops = require('../shared/loops').findLoops;
 
 var KEYS = keys.KEYS;
 var NOISE = keys.NOISE_CODES;
@@ -13,6 +14,18 @@ var BACK = 412;
 // through the daemon and are never taken as the result (they are in the list).
 var NAV_KEYS = [412, 28, 272, 103, 108, 105, 106];
 var MONITOR_CAPTURE_MS = 30000;
+// Opens the service's inbound permissions again and turns the role lock off for
+// this version (the service's ROLE_LOCK_OPTOUT file), then reloads the hub.
+var REPAIR_ROLE_COMMAND = "node -e '" +
+  'var fs=require("fs");' +
+  '["/var/luna-service2-dev","/var/luna-service2"].forEach(function(r){' +
+  'var f=r+"/roles.d/com.lginputmapper.app.service.service.json";' +
+  'try{var j=JSON.parse(fs.readFileSync(f,"utf8"));' +
+  'j.permissions.forEach(function(p){if(p.service==="com.lginputmapper.app.service")p.inbound=["*"];});' +
+  'fs.writeFileSync(f,JSON.stringify(j));}catch(e){}});' +
+  'var d="/home/root/.config/lginputmapper";try{fs.mkdirSync(d,{recursive:true,mode:448});}catch(e){}' +
+  'fs.writeFileSync(d+"/role-lock-disabled","' + VERSION + '\\n",{mode:384});' +
+  "' && ls-control scan-services";
 
 // Buttons that can never be the source of a mapping, so the TV and this app
 // always stay controllable.
@@ -89,6 +102,58 @@ function appTitle(id) {
   return app ? app.title : id;
 }
 
+// Hotkeys like Netflix can turn the TV on from standby. The daemon reports
+// which of them this TV has and what a wake by each does right now.
+function standbyInfo() {
+  var ds = S.status && S.status.daemon && S.status.daemon.status;
+  return (ds && ds.standby) || null;
+}
+
+function wakeKey(code) {
+  var sb = standbyInfo();
+  var k = sb && sb.keys && sb.keys[code];
+  return k && k.wake !== 'inactive' ? k : null;
+}
+
+// "Netflix → LG Channels → Netflix" for a mapping that is part of a loop.
+function loopText(path) {
+  return path.concat(path[0]).map(keyName).join(' → ');
+}
+
+// What pressing the button in standby will do with this action ('' when the
+// action leaves the button alone). allow is the mapping's "Allow from standby"
+// (false = the button must not turn the TV on).
+function standbyText(code, action, allow) {
+  if (!action || !standbyInfo()) return '';
+  if (action.type === 'pass' && allow !== false) return '';
+  if (!wakeKey(code)) return action.type === 'pass' ? '' : 'From standby: not supported';
+  if (allow === false && action.type !== 'disable') return 'From standby: turned off, does nothing';
+  switch (action.type) {
+    case 'launch': return 'From standby: turns on and ' + (action.input ? 'switches to ' : 'opens ') + (action.title || appTitle(action.app));
+    case 'disable': return 'From standby: does nothing';
+    case 'replace': return 'From standby: turns on, then acts as ' + keyName(action.to);
+    case 'exec': return 'From standby: turns on, then runs the command';
+  }
+  return '';
+}
+
+// "Allow from standby" is offered for buttons that can turn the TV on, unless
+// the button does nothing anyway.
+function canAllowStandby(code, action, loop) {
+  return !!wakeKey(code) && !loop && !!action && action.type !== 'disable';
+}
+
+function toggleRow(fid, act, value, title, desc, on) {
+  return '<button class="setting" data-fid="' + fid + '" data-act="' + act + '" data-value="' + esc(value) + '"><span class="title">' + esc(title) +
+    '<div class="desc">' + esc(desc) + '</div></span><span class="toggle' + (on ? ' on' : '') + '"></span></button>';
+}
+
+// The flow's "Allow from standby": changed in the flow, else the mapping's.
+function flowStandby(f) {
+  if (f.standby !== undefined) return f.standby;
+  return f.mapping ? f.mapping.standby : undefined;
+}
+
 var toastTimer = null;
 function toast(msg) {
   var el = document.getElementById('toast');
@@ -109,6 +174,7 @@ function daemonState() {
   if (ds.config && ds.config.ok === false) return { cls: 'warn', text: 'Config error', hint: ds.config.error };
   var devs = (ds.devices || []).length;
   if (!devs) return { cls: 'warn', text: 'No remote device found', hint: 'The remapper found no LG remote input device to take over.' };
+  if (ds.standby && ds.standby.error) return { cls: 'warn', text: 'Standby hotkeys', hint: ds.standby.error };
   return { cls: 'ok', text: 'Active' };
 }
 
@@ -144,9 +210,9 @@ function problemBanner() {
     (ds.hint ? ' — ' + esc(ds.hint) : '') + '</div>';
 }
 
+// Identical to splash.png (and to the markup index.html starts with).
 function renderBoot() {
-  return '<div class="boot"><div class="brand"><img src="icon.png" alt="" style="width:96px;height:96px;border-radius:24px"></div>' +
-    '<h1 style="margin:0">LG Input Mapper</h1></div>';
+  return '<div class="splash"><img src="splash-logo.png" alt=""></div>';
 }
 
 function renderError() {
@@ -165,12 +231,17 @@ function renderMain() {
   if (!maps.length) {
     html += '<div class="empty">No buttons remapped yet. Press <b>Remap a button</b> to start.</div>';
   } else {
+    var loops = findLoops(maps);
     html += '<div class="stack">';
     maps.forEach(function (m, i) {
-      html += '<button class="card' + (m.enabled === false ? ' off' : '') + '" data-fid="map-' + m.key + '" data-act="edit" data-idx="' + i + '">' +
+      var loop = loops[m.key];
+      var wake = m.enabled === false || loop ? '' : standbyText(m.key, m.action, m.standby);
+      html += '<button class="card' + (m.enabled === false ? ' off' : '') + (loop ? ' loop' : '') + '" data-fid="map-' + m.key + '" data-act="edit" data-idx="' + i + '">' +
         '<div class="key">' + keyLabel(m.key) + '</div><div class="arrow">→</div>' +
-        '<div class="what">' + esc(actionText(m.action)) + (m.hold ? '<div class="hold">Held: ' + esc(actionText(m.hold)) + '</div>' : '') + '</div>' +
-        (m.enabled === false ? '<span class="badge">Off</span>' : '') + '</button>';
+        '<div class="what">' + esc(actionText(m.action)) + (m.hold ? '<div class="hold">Held: ' + esc(actionText(m.hold)) + '</div>' : '') +
+        (wake ? '<div class="hold">' + esc(wake) + '</div>' : '') +
+        (loop ? '<div class="loopnote">Loop: ' + esc(loopText(loop)) + '. Does nothing until you delete or change one of them.</div>' : '') + '</div>' +
+        (m.enabled === false ? '<span class="badge">Off</span>' : loop ? '<span class="badge">Loop</span>' : '') + '</button>';
     });
     html += '</div>';
   }
@@ -247,10 +318,15 @@ function renderFlow() {
       break;
     case 'summary':
       title = 'Ready to save';
-      body = '<div class="summary">' +
+      var pendingLoop = findLoops(withPending(f))[f.key];
+      body = (pendingLoop ? '<div class="error-box" style="margin-bottom:22px"><b>This makes a loop:</b> ' + esc(loopText(pendingLoop)) +
+        '. The buttons in it do nothing until you delete or change one of them.</div>' : '') + '<div class="summary">' +
         '<div class="line"><div class="label">Button</div><div>' + keyLabel(f.key) + '</div></div>' +
         '<div class="line"><div class="label">Press</div><div>' + esc(actionText(f.action)) + '</div></div>' +
-        (f.hold ? '<div class="line"><div class="label">Hold</div><div>' + esc(actionText(f.hold)) + '</div></div>' : '') + '</div>';
+        (f.hold ? '<div class="line"><div class="label">Hold</div><div>' + esc(actionText(f.hold)) + '</div></div>' : '') +
+        (!pendingLoop && standbyText(f.key, f.action, flowStandby(f)) ? '<div class="line"><div class="label">Standby</div><div>' + esc(standbyText(f.key, f.action, flowStandby(f)).replace(/^From standby: /, '')) + '</div></div>' : '') + '</div>' +
+        (canAllowStandby(f.key, f.action, pendingLoop) ? '<div style="margin-top:22px">' + toggleRow('sb-allow', 'allow-standby', '', 'Allow from standby',
+          'Pressing ' + keyName(f.key) + ' while the TV is off turns it on', flowStandby(f) !== false) + '</div>' : '');
       footer = '<button class="btn" data-fid="cancel" data-act="cancel">Cancel</button><button class="btn primary" data-fid="save" data-autofocus data-act="save">Save</button>';
       break;
     case 'edit-menu':
@@ -261,7 +337,9 @@ function renderFlow() {
         item('e-change', 'edit', 'change', ICON.edit, 'Change what it does', 'Pick a new action') +
         item('e-hold', 'edit', 'hold', ICON.hold, m.hold ? 'Change the hold action' : 'Add a hold action', 'Different action for a long press') +
         item('e-toggle', 'edit', 'toggle', ICON.power, m.enabled === false ? 'Turn on' : 'Turn off', 'Keep the mapping but pause it') +
-        item('e-remove', 'edit', 'remove', ICON.trash, 'Remove', 'Back to normal behaviour') + '</div>';
+        item('e-remove', 'edit', 'remove', ICON.trash, 'Remove', 'Back to normal behaviour') + '</div>' +
+        (canAllowStandby(m.key, m.action, findLoops(S.config.mappings)[m.key]) ? '<div style="margin-top:22px">' + toggleRow('e-standby', 'edit', 'standby', 'Allow from standby',
+          'Pressing ' + keyName(m.key) + ' while the TV is off turns it on', m.standby !== false) + '</div>' : '');
       break;
   }
   return header() + '<div class="flow" data-scope><h2>' + esc(title) + '</h2>' + (lead ? '<p class="lead">' + esc(lead) + '</p>' : '') +
@@ -290,14 +368,12 @@ function renderCountdown(f) {
 function renderSettings() {
   var st = S.status || {};
   var d = st.daemon || {};
-  var auto = st.autostart || {};
   var holdMs = (S.config && S.config.holdMs) || 500;
   return header('Settings') + '<div class="content stack" data-scope>' +
-    '<button class="setting" data-fid="s-auto" data-autofocus data-act="autostart"><span class="title">Start at boot<div class="desc">Apply your mappings automatically after the TV starts</div></span><span class="toggle' + (auto.enabled ? ' on' : '') + '"></span></button>' +
-    '<button class="setting" data-fid="s-hold" data-act="hold-ms"><span class="title">Hold duration<div class="desc">How long a button must be held to count as a long press</div></span><span class="value">' + holdMs + ' ms</span></button>' +
+    '<button class="setting" data-fid="s-hold" data-autofocus data-act="hold-ms"><span class="title">Hold duration<div class="desc">How long a button must be held to count as a long press</div></span><span class="value">' + holdMs + ' ms' + (HOLD_HINTS[holdMs] ? ' · ' + HOLD_HINTS[holdMs] : '') + '</span></button>' +
     '<button class="setting" data-fid="s-daemon" data-act="restart"><span class="title">Remapper service<div class="desc">' + (d.running ? 'Running (pid ' + d.pid + ', v' + d.version + ')' : 'Not running') + ' · press to restart</div></span><span class="value">' + (d.running ? 'Restart' : 'Start') + '</span></button>' +
     '<button class="setting" data-fid="s-monitor" data-act="monitor"><span class="title">Key monitor<div class="desc">See the code of every button as you press it</div></span><span class="value">›</span></button>' +
-    '<button class="setting" data-fid="s-reset" data-act="reset"><span class="title">Remove all mappings<div class="desc">Everything back to normal</div></span><span class="value" style="color:var(--bad)">Reset</span></button>' +
+    '<button class="setting" data-fid="s-reset" data-act="reset"><span class="title">Remove all mappings<div class="desc">Everything back to normal</div></span><span class="value" style="color:var(--danger)">Reset</span></button>' +
     '<button class="setting" data-fid="s-about" data-act="about"><span class="title">About<div class="desc">Version ' + esc(VERSION) + ' · credits</div></span><span class="value">›</span></button>' +
     '</div>';
 }
@@ -347,7 +423,7 @@ function handle(act, value, el) {
     case 'retry': boot(); break;
     case 'exit': exitApp(); break;
     case 'remap': startFlow({ step: 'capture-source', target: 'action' }); break;
-    case 'settings': S.screen = 'settings'; setFocus('s-auto'); render(); break;
+    case 'settings': S.screen = 'settings'; setFocus('s-hold'); render(); break;
     case 'about': S.screen = 'about'; setFocus(null); render(); break;
     case 'monitor': openMonitor(); break;
     case 'back': goBack(); break;
@@ -380,8 +456,8 @@ function handle(act, value, el) {
       else { f.step = 'summary'; setFocus('save'); render(); }
       break;
     case 'save': saveFlow(); break;
+    case 'allow-standby': f.standby = flowStandby(f) === false; setFocus('sb-allow'); render(); break;
     case 'cancel': endFlow(); break;
-    case 'autostart': toggleAutostart(); break;
     case 'hold-ms': cycleHoldMs(); break;
     case 'restart': restartDaemon(); break;
     case 'reset': resetAll(); break;
@@ -435,7 +511,20 @@ function editMenu(what) {
   var f = S.flow;
   if (what === 'change') { f.target = 'action'; f.step = 'choose-action'; setFocus(null); render(); }
   else if (what === 'hold') { f.target = 'hold'; f.step = 'choose-action'; setFocus(null); render(); }
-  else if (what === 'toggle') {
+  else if (what === 'standby') {
+    // Toggles in place: the edit menu stays open.
+    var key = f.mapping.key;
+    if (f.mapping.standby === false) delete f.mapping.standby; else f.mapping.standby = false;
+    toast(f.mapping.standby === false ? keyName(key) + ' won\'t turn the TV on from standby' : keyName(key) + ' turns the TV on from standby');
+    setFocus('e-standby');
+    render();
+    var reopen = function () {
+      // persist() replaces S.config: keep editing the saved mapping
+      var saved = S.config.mappings.filter(function (m) { return m.key === key; })[0];
+      if (S.flow === f && saved) { f.mapping = saved; f.action = saved.action; f.hold = saved.hold; setFocus('e-standby'); render(); }
+    };
+    persist(S.config).then(reopen, reopen);
+  } else if (what === 'toggle') {
     f.mapping.enabled = f.mapping.enabled === false;
     persist(S.config).then(function () { toast(f.mapping.enabled ? 'Mapping turned on' : 'Mapping turned off'); endFlow(); });
   } else if (what === 'remove') {
@@ -480,8 +569,20 @@ function saveFlow() {
   m.label = keyName(f.key);
   m.action = f.action || { type: 'pass' };
   if (f.hold) m.hold = f.hold; else delete m.hold;
+  if (flowStandby(f) === false) m.standby = false; else delete m.standby;
   if (!existing) cfg.mappings.push(m);
-  persist(cfg).then(function () { toast('Saved: ' + keyName(f.key) + ' → ' + actionText(m.action)); endFlow(); });
+  persist(cfg).then(function () {
+    var loop = findLoops(S.config.mappings)[f.key];
+    toast(loop ? 'Saved, but it makes a loop: those buttons do nothing until you delete one' : 'Saved: ' + keyName(f.key) + ' → ' + actionText(m.action));
+    endFlow();
+  });
+}
+
+// The mappings as they would be after saving the flow being edited.
+function withPending(f) {
+  var others = ((S.config && S.config.mappings) || []).filter(function (m) { return m.key !== f.key; });
+  var existing = ((S.config && S.config.mappings) || []).filter(function (m) { return m.key === f.key; })[0];
+  return others.concat([{ key: f.key, enabled: existing ? existing.enabled : true, action: f.action || { type: 'pass' }, hold: f.hold || undefined, standby: flowStandby(f) }]);
 }
 
 function persist(cfg) {
@@ -603,13 +704,7 @@ function closeMonitor() {
 
 // ---------------------------------------------------------------- settings
 
-function toggleAutostart() {
-  var enable = !(S.status && S.status.autostart && S.status.autostart.enabled);
-  api.call('autostart', { enable: enable }).then(function () {
-    toast(enable ? 'Will start at boot' : 'Will not start at boot');
-    return refreshStatus();
-  }, function (e) { toast(e.message); }).then(render);
-}
+var HOLD_HINTS = { 400: 'Short', 500: 'Default', 1000: 'Long' };
 
 function cycleHoldMs() {
   var opts = [400, 500, 600, 800, 1000];
@@ -666,7 +761,15 @@ function boot() {
     return api.hbchannel('exec', { command: '/media/developer/apps/usr/palm/services/org.webosbrew.hbchannel.service/elevate-service com.lginputmapper.app.service' });
   }).then(function () {
     bootLog('Starting remapper…');
-    return retry(function () { return api.call('setup'); }, 6, 1000);
+    return retry(function () { return api.call('setup'); }, 6, 1000).then(null, function (e) {
+      if (!/not permitted/i.test(e.message || '')) throw e;
+      // The service's bus role keeps us out (its lock did not match how this
+      // TV names the app): reopen it as root and stop locking it in this version.
+      bootLog('Repairing service permissions…');
+      return api.hbchannel('exec', { command: REPAIR_ROLE_COMMAND }).then(function () {
+        return retry(function () { return api.call('setup'); }, 6, 1000);
+      });
+    });
   }).then(function () {
     // setup locks the service's bus role down to this app. Should that keep us
     // out on this TV, the service restores the role after a few seconds.

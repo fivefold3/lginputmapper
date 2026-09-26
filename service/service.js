@@ -23,6 +23,10 @@ var LEGACY_DIR = '/home/root/.config/lginputhook';
 var LEGACY_PATH = LEGACY_DIR + '/keybinds.json';
 var PRERELEASE_PATHS = ['/home/root/.config/magicremap/config.json', LEGACY_DIR + '/config.json'];
 var STATE_DIR = '/tmp/lginputmapperd';
+// Kept by the daemon while it has changed the TV's standby hotkey table.
+var STANDBY_STATE = CONFIG_DIR + '/standby.json';
+var STANDBY_RESTORE = CONFIG_DIR + '/standby-restore.json';
+var STANDBY_RESTORE_MICOM = CONFIG_DIR + '/standby-restore-micom.json';
 var INIT_DIR = '/var/lib/webosbrew/init.d';
 var INIT_SCRIPT = INIT_DIR + '/lginputmapper';
 var HBCHANNEL_SERVICE = '/media/developer/apps/usr/palm/services/org.webosbrew.hbchannel.service';
@@ -34,6 +38,9 @@ var INSTALL_DIRS = [
 ];
 // Homebrew Channel's elevate-service opens our LS2 role to everyone; see lockRole().
 var LUNA_ROOTS = ['/var/luna-service2-dev', '/var/luna-service2'];
+// The app's names on the bus: WAM registers web apps as "<app id>-<n>" (the
+// app's own role allows "com.lginputmapper.app-*").
+var APP_BUS_NAMES = [APP_ID, APP_ID + '-*'];
 var ELEVATE_NAMES = ['*', 'com.webos.service.capture.client*'];
 // Written when locking the role cut the app off, so this version stops trying.
 var ROLE_LOCK_OPTOUT = CONFIG_DIR + '/role-lock-disabled';
@@ -172,11 +179,13 @@ function startDaemon(replace) {
   log('started daemon ' + bin + (replace ? ' (replace)' : ''));
 }
 
+// SIGUSR2 also makes the daemon give the TV's standby hotkeys back to LG.
+// (--replace and reboots use SIGTERM, which keeps them.)
 function stopDaemon() {
   requireRoot();
   var st = daemonStatus();
   if (st.running) {
-    try { process.kill(st.pid, 'SIGTERM'); } catch (e) {}
+    try { process.kill(st.pid, 'SIGUSR2'); } catch (e) {}
   }
 }
 
@@ -216,9 +225,25 @@ function initScriptContents() {
   return [
     '#!/bin/sh',
     '# Autostart for LG Input Mapper (' + APP_ID + '). Homebrew Channel runs the',
-    '# scripts in ' + INIT_DIR + ' as root at boot. Removes itself if the app is gone.',
+    '# scripts in ' + INIT_DIR + ' as root at boot. If the app is gone and the daemon',
+    '# could not clean up: gives the TV\'s standby hotkeys and their locks back to LG,',
+    '# removes the config directory and then itself.',
     'BIN="' + daemonBinary() + '"',
-    'if [ ! -x "$BIN" ]; then rm -f "$0"; exit 0; fi',
+    'if [ ! -x "$BIN" ]; then',
+    '  R=' + STANDBY_RESTORE,
+    '  M=' + STANDBY_RESTORE_MICOM,
+    '  if [ -s "$R" ]; then',
+    '    luna-send -n 1 -w 10000 luna://com.webos.settingsservice/setSystemSettings "$(cat "$R")" </dev/null 2>/dev/null |',
+    '      grep -q \'"returnValue": *true\' || exit 0',
+    '  fi',
+    '  if [ -s "$M" ]; then',
+    '    luna-send -n 1 -w 10000 luna://com.webos.service.micomservice/setCPHotKeyListLock "$(cat "$M")" </dev/null 2>/dev/null |',
+    '      grep -q \'"returnValue": *true\' || exit 0',
+    '  fi',
+    '  rm -rf ' + CONFIG_DIR,
+    '  rm -f "$0"',
+    '  exit 0',
+    'fi',
     'mkdir -p -m 700 ' + STATE_DIR,
     'nohup "$BIN" --replace --config ' + CONFIG_PATH + ' --state-dir ' + STATE_DIR +
       ' --log ' + STATE_DIR + '/daemon.log --pidfile ' + STATE_DIR + '/pid >/dev/null 2>&1 </dev/null &',
@@ -233,15 +258,12 @@ function autostartStatus() {
   return { enabled: exists, upToDate: current, path: INIT_SCRIPT };
 }
 
-function setAutostart(enable) {
+// The remapper always starts at boot: setup (re)writes the script on every launch.
+function installAutostart() {
   requireRoot();
-  if (enable) {
-    mkdirp(INIT_DIR);
-    fs.writeFileSync(INIT_SCRIPT, initScriptContents());
-    fs.chmodSync(INIT_SCRIPT, 493);
-  } else if (fs.existsSync(INIT_SCRIPT)) {
-    fs.unlinkSync(INIT_SCRIPT);
-  }
+  mkdirp(INIT_DIR);
+  fs.writeFileSync(INIT_SCRIPT, initScriptContents());
+  fs.chmodSync(INIT_SCRIPT, 493);
   return autostartStatus();
 }
 
@@ -293,9 +315,12 @@ var ROLE_LOCK_CONFIRM_MS = 8000;
 // Undo what elevate-service adds to our role (any name, any caller) and only
 // let the app call in. The app runs elevate-service on every launch, which
 // reopens the role, and calls setup right after, which locks it again.
-// Should the hub then keep the app out on some TV (it names web app callers
-// differently), no call arrives and revertRoleLock() restores the role and
-// stops locking it for this version. Resolves to true if a role file changed.
+// The hub checks permissions only when it connects two clients, so a lock that
+// keeps the app out shows up at its next fresh connection (after a reboot, or
+// once either side restarted). Should no call arrive after locking, or should
+// the app find itself refused later (it then reopens the role through Homebrew
+// Channel and writes ROLE_LOCK_OPTOUT), locking stops for this version.
+// Resolves to true if a role file changed.
 function lockRole() {
   var originals = {};
   LUNA_ROOTS.forEach(function (root) {
@@ -307,7 +332,7 @@ function lockRole() {
     var before = JSON.stringify(role);
     role.allowedNames = role.allowedNames.filter(function (n) { return ELEVATE_NAMES.indexOf(n) < 0; });
     role.permissions = role.permissions.filter(function (p) { return p && ELEVATE_NAMES.indexOf(p.service) < 0; });
-    role.permissions.forEach(function (p) { p.inbound = [APP_ID]; });
+    role.permissions.forEach(function (p) { p.inbound = APP_BUS_NAMES.slice(); });
     var after = JSON.stringify(role);
     if (after === before) return;
     log('locking role ' + file + ': ' + before + ' -> ' + after);
@@ -422,6 +447,7 @@ function validateConfig(cfg) {
     if (!m || typeof m !== 'object') throw new ApiError('mapping #' + n + ' is invalid');
     if (!(m.key > 0 && m.key < 4096)) throw new ApiError('mapping #' + n + ' has an invalid key code');
     if (seen[m.key]) throw new ApiError('key ' + m.key + ' is mapped twice');
+    if (m.standby !== undefined && typeof m.standby !== 'boolean') throw new ApiError('mapping #' + n + ': standby must be true or false');
     seen[m.key] = true;
     [m.action, m.hold].forEach(function (a, ai) {
       if (!a) { if (ai === 0) throw new ApiError('mapping #' + n + ' has no action'); return; }
@@ -596,11 +622,6 @@ var api = {
     throw new ApiError('unknown daemon action');
   },
 
-  autostart: function (params) {
-    if (typeof params.enable === 'boolean') return { autostart: setAutostart(params.enable) };
-    return { autostart: autostartStatus() };
-  },
-
   clientLog: function (params) {
     log('app: ' + String(params.msg || '').slice(0, 300));
     return {};
@@ -635,7 +656,7 @@ var api = {
   setup: function () {
     requireRoot();
     try { loadConfig(); } catch (e) { log('config: ' + e.message); }
-    setAutostart(true);
+    installAutostart();
     return ensureDaemon().then(function (d) {
       return harden().then(function (h) {
         return { daemon: d, autostart: autostartStatus(), hardening: h };

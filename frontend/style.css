@@ -112,7 +112,6 @@ svg.ic { width: 1.15em; height: 1.15em; fill: none; stroke: currentColor; stroke
 .mon .ev .v { width: 130px; color: var(--muted); }
 
 /* boot / errors */
-.boot { flex: 1; display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 20px; }
 .error-box { padding: 26px 30px; border-radius: var(--radius); background: rgba(255, 92, 108, .14); border: 1px solid rgba(255, 92, 108, .5); }
 
 .toast { position: fixed; left: 50%; bottom: 60px; transform: translateX(-50%) translateY(30px); opacity: 0; padding: 18px 30px;
@@ -128,3 +127,14 @@ svg.ic { width: 1.15em; height: 1.15em; fill: none; stroke: currentColor; stroke
   .card { flex-wrap: wrap; } .card .key { min-width: 0; }
   .mon .ev { flex-wrap: wrap; gap: 10px; }
 }
+
+/* Mappings that form a loop of "acts as" buttons: kept, but they do nothing until it is broken. */
+.card.loop { box-shadow: inset 0 0 0 3px var(--danger); background: rgba(255, 92, 108, 0.12); }
+.card.loop .badge { background: var(--danger); color: #fff; }
+.card .what .loopnote { color: var(--danger); font-size: 21px; margin-top: 4px; }
+.card.loop:focus { background: var(--focus-bg); }
+
+/* Start-up screen: pixel for pixel the launch splash (assets/splash.png). */
+.splash { position: fixed; top: 0; left: 0; right: 0; bottom: 0; z-index: 10; background: #000;
+  display: flex; align-items: center; justify-content: center; }
+.splash img { width: 384px; height: 384px; }
