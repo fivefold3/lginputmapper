@@ -28,7 +28,17 @@ installing: it elevates its service, starts the remapper and enables the boot
 script.
 
 Some buttons are deliberately not remappable so the TV stays usable: the
-D-pad, OK, Back, Home, Settings, Power, volume and channel.
+D-pad, OK, Back, Settings, Power, volume and channel.
+
+Home is the exception. It opens the app bar and is normally how you get back to
+this app, so remapping it asks for confirmation first and only accepts two
+actions: **launch an app** (map it to your own launcher and Home always returns
+there) or **keep the normal press** (to attach a hold action). The hold action
+can also **open the stock launcher**, so a Home remapped to another app still
+reaches the TV's own app bar on a long press. Everything else is hidden for
+Home, and it can never act as another button — so it cannot end up in a loop
+that leaves it doing nothing. If you do lock yourself out, a Home
+mapping can be deleted by editing `config.json` over the root shell.
 
 ## Buttons that turn the TV on
 

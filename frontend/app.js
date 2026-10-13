@@ -9,7 +9,12 @@ var KEYS = keys.KEYS;
 var NOISE = keys.NOISE_CODES;
 var VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : 'dev';
 var COUNTDOWN_MS = 10000;
+var CONFIRM_CAPTURE_MS = 60000;
 var BACK = 412;
+var HOME = 773;
+// The TV's own launcher (the Home screen / app bar), so a remapped Home can
+// still be held to get back to it.
+var HOME_APP = 'com.webos.app.home';
 // Keys the app itself needs while listening for a *target* button; they pass
 // through the daemon and are never taken as the result (they are in the list).
 var NAV_KEYS = [412, 28, 272, 103, 108, 105, 106];
@@ -28,8 +33,9 @@ var REPAIR_ROLE_COMMAND = "node -e '" +
   "' && ls-control scan-services";
 
 // Buttons that can never be the source of a mapping, so the TV and this app
-// always stay controllable.
-var EXCLUDED = { 103: 1, 108: 1, 105: 1, 106: 1, 28: 1, 272: 1, 412: 1, 773: 1, 139: 1, 116: 1, 115: 1, 114: 1, 402: 1, 403: 1 };
+// always stay controllable. Home is the exception: it can be remapped, but only
+// after the confirmation in the capture flow and only to pass or launch an app.
+var EXCLUDED = { 103: 1, 108: 1, 105: 1, 106: 1, 28: 1, 272: 1, 412: 1, 139: 1, 116: 1, 115: 1, 114: 1, 402: 1, 403: 1 };
 var EXCLUDED_LIST = Object.keys(EXCLUDED).map(function (k) { return parseInt(k, 10); });
 
 var ICON = {
@@ -42,6 +48,7 @@ var ICON = {
   term: '<svg class="ic" viewBox="0 0 24 24"><path d="M4 17l6-5-6-5M12 19h8"/></svg>',
   none: '<svg class="ic" viewBox="0 0 24 24"><path d="M5 12h14"/></svg>',
   hold: '<svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>',
+  home: '<svg class="ic" viewBox="0 0 24 24"><path d="M3 11l9-7 9 7M5 10v10h14V10"/></svg>',
   check: '<svg class="ic" viewBox="0 0 24 24"><path d="M5 12l5 5L20 7"/></svg>',
   edit: '<svg class="ic" viewBox="0 0 24 24"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>',
   power: '<svg class="ic" viewBox="0 0 24 24"><path d="M18.4 6.6a9 9 0 1 1-12.8 0M12 2v10"/></svg>',
@@ -262,16 +269,28 @@ function renderFlow() {
       body = renderCountdown(f);
       if (f.step === 'capture-target') footer = '<button class="btn" data-fid="pick-list" data-act="pick-list">Choose from a list instead</button>';
       break;
+    case 'confirm-home':
+      title = 'Remap Home?';
+      lead = 'Home opens the app bar and is how you reach LG Input Mapper. If you remap it, you may not be able to open the app bar or this app again.';
+      body = '<div class="error-box">To keep the TV usable, Home can only launch an app or keep its normal press. Everything else stays unavailable for it.</div>';
+      footer = '<button class="btn" data-fid="home-no" data-act="home-no">Cancel</button>' +
+        '<button class="btn primary" data-fid="home-yes" data-act="home-yes">Continue</button>';
+      break;
     case 'choose-action':
       var forHold = f.target === 'hold';
+      // Home stays able to open the app bar or this app: it may only pass
+      // through or launch an app. No disable/replace/input/command, so it can
+      // never join a loop of "acts as" mappings either.
+      var isHome = f.key === HOME;
       title = forHold ? 'What should ' + keyName(f.key) + ' do when held?' : 'What should ' + keyName(f.key) + ' do?';
       lead = forHold ? 'Hold for about half a second to trigger this instead of the normal tap action.' : 'Pick what happens when you press it.';
       body = '<div class="list">' +
-        item('act-disable', 'act', 'disable', ICON.block, 'Do nothing', 'Disable the button completely') +
-        item('act-replace', 'act', 'replace', ICON.swap, 'Act as another button', 'Play/Pause, Mute, Info, numbers, colours, or any button') +
+        (isHome ? '' : item('act-disable', 'act', 'disable', ICON.block, 'Do nothing', 'Disable the button completely')) +
+        (isHome ? '' : item('act-replace', 'act', 'replace', ICON.swap, 'Act as another button', 'Play/Pause, Mute, Info, numbers, colours, or any button')) +
         item('act-launch', 'act', 'launch', ICON.play, 'Launch an app', 'Open any installed app') +
-        item('act-input', 'act', 'input', ICON.hdmi, 'Switch to an input', 'HDMI, Live TV and other inputs on this TV') +
-        item('act-exec', 'act', 'exec', ICON.term, 'Run a command', 'Shell command as root, with presets') +
+        (isHome && forHold ? item('act-home', 'act', 'home', ICON.home, 'Open the stock launcher', 'The TV\'s own Home screen and app bar') : '') +
+        (isHome ? '' : item('act-input', 'act', 'input', ICON.hdmi, 'Switch to an input', 'HDMI, Live TV and other inputs on this TV')) +
+        (isHome ? '' : item('act-exec', 'act', 'exec', ICON.term, 'Run a command', 'Shell command as root, with presets')) +
         (forHold ? item('act-none', 'act', 'none', ICON.none, 'No hold action', 'Keep only the tap action')
                  : item('act-pass', 'act', 'pass', ICON.hold, 'Keep the normal press', 'Leave the button as it is and only add a hold action')) +
         '</div>';
@@ -434,6 +453,14 @@ function handle(act, value, el) {
       } else editMenu(value);
       break;
     case 'pick-list': stopCountdown(); f.step = 'pick-key'; setFocus(null); render(); break;
+    case 'home-yes':
+      api.call('stopCapture', {}).then(null, function () {});
+      f.step = 'choose-action'; setFocus(null); render();
+      break;
+    case 'home-no':
+      api.call('stopCapture', {}).then(null, function () {});
+      startFlow({ step: 'capture-source', target: 'action' });
+      break;
     case 'act': chooseAction(value); break;
     case 'pick-key': applyAction({ type: 'replace', to: parseInt(value, 10) }); break;
     case 'pick-app': applyAction({ type: 'launch', app: value, title: appTitle(value) }); break;
@@ -468,6 +495,7 @@ function goBack() {
   if (S.screen === 'flow') {
     var f = S.flow;
     stopCountdown();
+    if (f.step === 'confirm-home') { api.call('stopCapture', {}).then(null, function () {}); return startFlow({ step: 'capture-source', target: 'action' }); }
     if (f.step === 'capture-source' || f.step === 'edit-menu' || f.step === 'summary' && !f.editing) return endFlow();
     if (f.step === 'summary') return endFlow();
     if (f.step === 'choose-action') {
@@ -537,6 +565,7 @@ function chooseAction(type) {
   var f = S.flow;
   if (type === 'none') { f.hold = null; f.step = 'summary'; setFocus('save'); return render(); }
   if (type === 'pass') { f.action = { type: 'pass' }; f.target = 'hold'; f.step = 'choose-action'; setFocus(null); return render(); }
+  if (type === 'home') return applyAction({ type: 'launch', app: HOME_APP, title: 'the stock launcher' });
   if (type === 'disable') return applyAction({ type: 'disable' });
   if (type === 'replace') { f.step = 'capture-target'; setFocus(null); render(); return startCountdown(); }
   if (type === 'input') {
@@ -644,6 +673,7 @@ function startCountdown() {
         f.key = hit.code;
         var existing = S.config.mappings.filter(function (m) { return m.key === hit.code; })[0];
         if (existing) { startFlow({ step: 'edit-menu', mapping: existing, key: existing.key, action: existing.action, hold: existing.hold, editing: true }); return; }
+        if (hit.code === HOME) { enterHomeConfirm(); return; }
         f.step = 'choose-action';
       } else {
         applyAction({ type: 'replace', to: hit.code });
@@ -660,6 +690,17 @@ function stopCountdown() {
   cd.active = false;
   clearInterval(cd.timer); clearInterval(cd.poll);
   api.call('stopCapture', {}).then(null, function () {});
+}
+
+// Remapping Home needs an explicit confirmation. Keep swallowing while the
+// warning is up (D-pad/OK/Back stay live) so a second Home press cannot throw
+// the app bar over this screen before anything has been saved.
+function enterHomeConfirm() {
+  var f = S.flow;
+  f.step = 'confirm-home';
+  setFocus('home-no');
+  render();
+  api.call('startCapture', { ms: CONFIRM_CAPTURE_MS, swallow: true, passthrough: NAV_KEYS }).then(null, function () {});
 }
 
 // ----------------------------------------------------------------- monitor
